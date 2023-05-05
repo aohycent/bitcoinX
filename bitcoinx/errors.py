@@ -68,6 +68,26 @@ class DecryptionError(ValueError):
     '''Raised by PrivateKey.decrypt_message for various failures.'''
 
 
+#
+# Network errors
+#
+
+class BadChecksumError(Exception):
+    '''Raise when a message's checksum is bad.'''
+
+
+class ProtocolError(Exception):
+    '''Raise on detecting a network protcol error.'''
+
+
+class ForceDisconnectError(Exception):
+    '''Raise on an error that must force a disconnection.'''
+
+
+#
+# Script errors
+#
+
 class ScriptError(Exception):
     '''Base class for script errors.'''
 
@@ -79,6 +99,10 @@ class TruncatedScriptError(ScriptError):
 class InterpreterError(ScriptError):
     '''Base class for interpreter errors.'''
 
+
+#
+# Interpreter errors
+#
 
 class ScriptTooLarge(InterpreterError):
     '''Raised when a script is too long.'''
