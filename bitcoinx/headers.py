@@ -9,6 +9,7 @@
 
 
 import math
+import socket
 
 import attr
 
@@ -427,6 +428,11 @@ class Network:
             if xver_bytes == network.xprv_verbytes:
                 return network, False
         raise ValueError(f'invalid xver_bytes {xver_bytes}')
+
+    async def node_addresses(self, getaddrinfo, dns_seed):
+        '''Given a dns seed (i.e., a hostname) return a list of potential network nodes.
+        Each is a tuple passable to socket.connect().'''
+        return await getaddrinfo(dns_seed, self.default_port, type=socket.SOCK_STREAM)
 
 
 def _required_bits_fortnightly(network, chain, height):

@@ -4,89 +4,155 @@
 #
 
 import attr
+import logging
 import re
 import time
 from enum import IntEnum, IntFlag
 from functools import partial
-from hashlib import sha256
-from io import BytesIO
 from ipaddress import ip_address, IPv4Address, IPv6Address
 from struct import Struct, error as struct_error
 
+from .errors import ConnectionClosedError, ProtocolError
+from .hashes import double_sha256
 from .packing import (
     pack_byte, pack_le_int32, pack_le_uint32, pack_le_int64, pack_le_uint64, pack_varint,
     pack_varbytes, pack_port, unpack_port,
     read_varbytes, read_varint, read_le_int32, read_le_uint32, read_le_uint64, read_le_int64,
 )
 
-from .errors import ConnectionClosedError, ForceDisconnectError, ProtocolError
 
+# Standard and extended message hedaers
+std_header_struct = Struct('<4s12sI4s')
+ext_header_struct = Struct('<4s12sI4s12sQ')
+ext_extra_struct = Struct('<12sQ')
 
-header_struct = Struct('<4s12sI4s')
-unpack_header = header_struct.unpack
-pack_header = header_struct.pack
 # This is the maximum payload length a non-streaming command can accept.  Such
 # payloads are buffered and processed as a unit by the handler.
 ATOMIC_PAYLOAD_SIZE = 2_000_000
 PROTOCOL_VERSION = 70015
 
 
-@attr.s(slots=True)
-class NetMessage:
+class ServiceFlags(IntFlag):
+    NODE_NONE = 0
+    NODE_NETWORK = 1 << 0
+    NODE_GETUTXO = 1 << 1
+    NODE_BLOOM = 1 << 2
 
-    HEADER_SIZE = header_struct.size
+
+class InventoryKind(IntEnum):
+    ERROR = 0
+    TX = 1
+    BLOCK = 2
+    # The following occur only in getdata messages.  Invs always use TX or BLOCK.
+    FILTERED_BLOCK = 3
+    COMPACT_BLOCK = 4
+
+
+class ServicePart(IntEnum):
+    PROTOCOL = 0
+    HOST = 1
+    PORT = 2
+
+
+async def read_exact(read, size):
+    '''Asynchronously read exactly size bytes using read().
+    Raises: ConnectionClosedError.'''
+    # Optimize normal case
+    part = await read(size)
+    if len(part) == size:
+        return part
+    parts = []
+    while part:
+        parts.append(part)
+        size -= len(part)
+        if not size:
+            return b''.join(parts)
+        part = await read(size)
+    raise ConnectionClosedError(f'connection closed with {size:,d} bytes left')
+
+
+@attr.s(slots=True)
+class MessageHeader:
+    '''The header of a network protocol message.'''
+
+    # Extended headers were introduced in the BSV 1.0.10 node software.
+
     COMMAND_LEN = 12
+    STD_HEADER_SIZE = std_header_struct.size
+    EXT_HEADER_SIZE = ext_header_struct.size
 
     magic = attr.ib()
     command_bytes = attr.ib()
     payload_len = attr.ib()
     checksum = attr.ib()
+    is_extended = attr.ib()
 
     @classmethod
-    def from_bytes(cls, header):
-        return cls(*unpack_header(header))
+    async def from_stream(cls, read):
+        raw_std = await read_exact(read, cls.STD_HEADER_SIZE)
+        magic, command, payload_len, checksum = std_header_struct.unpack(raw_std)
+        is_extended = False
+        if command == cls.EXTMSG:
+            raw_ext = await read_exact(read, cls.EXT_HEADER_SIZE - cls.STD_HEADER_SIZE)
+            command, payload_len = ext_extra_struct.unpack(raw_ext)
+            is_extended = True
+        return cls(magic, command, payload_len, checksum, is_extended)
 
     def __str__(self):
         '''The message command as text (or a hex representation if not ASCII).'''
         command = self.command_bytes.rstrip(b'\0')
         return command.decode() if command.isascii() else '0x' + command.hex()
 
+    @classmethod
+    def std_bytes(cls, magic, command, payload):
+        return std_header_struct.pack(
+            magic, command, len(payload), double_sha256(payload)[:4]
+        )
+
+    @classmethod
+    def ext_bytes(cls, magic, command, payload_len):
+        return ext_header_struct.pack(
+            magic, cls.EXTMSG, 0xffffffff, bytes(4), command, payload_len
+        )
+
+
 
 def _command(text):
-    return text.encode().ljust(NetMessage.COMMAND_LEN, b'\0')
+    return text.encode().ljust(MessageHeader.COMMAND_LEN, b'\0')
 
 
 # List these explicitly because pylint is dumb
-NetMessage.ADDR = _command('addr')
-NetMessage.BLOCK = _command('block')
-NetMessage.BLOCKTXN = _command('blocktxn')
-NetMessage.CMPCTBLOCK = _command('cmpctblock')
-NetMessage.CREATESTRM = _command('createstrm')
-NetMessage.FEEFILTER = _command('feefilter')
-NetMessage.FILTERADD = _command('filteradd')
-NetMessage.FILTERCLEAR = _command('filterclear')
-NetMessage.FILTERLOAD = _command('filterload')
-NetMessage.GETADDR = _command('getaddr')
-NetMessage.GETBLOCKS = _command('getblocks')
-NetMessage.GETBLOCKTXN = _command('getblocktxn')
-NetMessage.GETDATA = _command('getdata')
-NetMessage.GETHEADERS = _command('getheaders')
-NetMessage.HEADERS = _command('headers')
-NetMessage.INV = _command('inv')
-NetMessage.MEMPOOL = _command('mempool')
-NetMessage.MERKELBLOCK = _command('merkleblock')
-NetMessage.NOTFOUND = _command('notfound')
-NetMessage.PING = _command('ping')
-NetMessage.PONG = _command('pong')
-NetMessage.PROTOCONF = _command('protoconf')
-NetMessage.REJECT = _command('reject')
-NetMessage.REPLY = _command('reply')
-NetMessage.SENDCMPCT = _command('sendcmpct')
-NetMessage.SENDHEADERS = _command('sendheaders')
-NetMessage.STREAMACK = _command('streamack')
-NetMessage.TX = _command('tx')
-NetMessage.VERACK = _command('verack')
-NetMessage.VERSION = _command('version')
+MessageHeader.ADDR = _command('addr')
+MessageHeader.BLOCK = _command('block')
+MessageHeader.BLOCKTXN = _command('blocktxn')
+MessageHeader.CMPCTBLOCK = _command('cmpctblock')
+MessageHeader.CREATESTRM = _command('createstrm')
+MessageHeader.EXTMSG = _command('extmsg')
+MessageHeader.FEEFILTER = _command('feefilter')
+MessageHeader.FILTERADD = _command('filteradd')
+MessageHeader.FILTERCLEAR = _command('filterclear')
+MessageHeader.FILTERLOAD = _command('filterload')
+MessageHeader.GETADDR = _command('getaddr')
+MessageHeader.GETBLOCKS = _command('getblocks')
+MessageHeader.GETBLOCKTXN = _command('getblocktxn')
+MessageHeader.GETDATA = _command('getdata')
+MessageHeader.GETHEADERS = _command('getheaders')
+MessageHeader.HEADERS = _command('headers')
+MessageHeader.INV = _command('inv')
+MessageHeader.MEMPOOL = _command('mempool')
+MessageHeader.MERKELBLOCK = _command('merkleblock')
+MessageHeader.NOTFOUND = _command('notfound')
+MessageHeader.PING = _command('ping')
+MessageHeader.PONG = _command('pong')
+MessageHeader.PROTOCONF = _command('protoconf')
+MessageHeader.REJECT = _command('reject')
+MessageHeader.REPLY = _command('reply')
+MessageHeader.SENDCMPCT = _command('sendcmpct')
+MessageHeader.SENDHEADERS = _command('sendheaders')
+MessageHeader.STREAMACK = _command('streamack')
+MessageHeader.TX = _command('tx')
+MessageHeader.VERACK = _command('verack')
+MessageHeader.VERSION = _command('version')
 
 
 # See http://stackoverflow.com/questions/2532053/validate-a-hostname-string
@@ -148,12 +214,6 @@ def validate_protocol(protocol):
     if not re.match(PROTOCOL_REGEX, protocol):
         raise ValueError(f'invalid protocol: {protocol}')
     return protocol.lower()
-
-
-class ServicePart(IntEnum):
-    PROTOCOL = 0
-    HOST = 1
-    PORT = 2
 
 
 def _split_address(string):
@@ -315,13 +375,6 @@ class Service:
 
     def __repr__(self):
         return f"Service({self._protocol!r}, '{self._address}')"
-
-
-class ServiceFlags(IntFlag):
-    NODE_NONE = 0
-    NODE_NETWORK = 1 << 0
-    NODE_GETUTXO = 1 << 1
-    NODE_BLOOM = 1 << 2
 
 
 class BitcoinService:
@@ -508,476 +561,10 @@ class ServiceDetails:
         )
 
 
-class PayloadReader:
-
-    streaming_commands = {
-        NetMessage.BLOCK, NetMessage.CMPCTBLOCK, NetMessage.BLOCKTXN,
-        NetMessage.TX, NetMessage.INV, NetMessage.GETDATA
-    }
-
-    def __init__(self, session, message):
-        self.sock = session.sock
-        self.message = message
-        self.remaining = message.payload_len
-        self.hasher = sha256()
-        self.logger = session.logger
-
-    def validate_checksum(self):
-        assert not self.remaining
-        ours = sha256(self.hasher.digest()).digest()[:4]
-        if ours != self.message.checksum:
-            raise ProtocolError(f'checksum mismatch in {self.message}: '
-                                f'ours=0x{ours.hex()} theirs=0x{self.message.checksum.hex()}')
-
-    async def read(self, size):
-        size = min(self.remaining, size)
-        result = await read_exact(self.sock.recv, size)
-        self.hasher.update(result)
-        self.remaining -= size
-        return result
-
-    async def handle(self, handler):
-        if not handler:
-            self.logger.warning(f'received unknown message {self.message}')
-            await self.consume_remainder()
-        elif self.message.command_bytes in self.streaming_commands:
-            await handler(self)
-            if self.remaining:
-                self.logger.warning(f'ignoring overlong {self.message} message')
-                await self.consume_remainder()
-            else:
-                self.validate_checksum()
-        elif self.remaining <= ATOMIC_PAYLOAD_SIZE:
-            # Handle atomically
-            payload = await self.read(self.remaining)
-            self.validate_checksum()
-            read = BytesIO(payload).read
-            await handler(read)
-            if read(1):
-                self.logger.warning(f'ignoring overlong {self.message} message')
-        else:
-            await self.consume_remainder()
-            raise ProtocolError(f'oversized {self.message} payload of '
-                                f'{self.message.payload_len:,d} bytes')
-
-    async def consume_remainder(self, timeout=1.0):
-        try:
-            async with timeout_after(timeout):
-                while self.remaining:
-                    await self.read(1_000_000)
-        except TaskTimeout:
-            raise ForceDisconnectError(f'timeout consuming payload of length '
-                                       f'{self.message.payload_len:,d} '
-                                       f'of {self.message} message') from None
-        self.validate_checksum()
-
-    async def recv_into(self, buffer, nbytes=0):
-        # This works best if buffer is a memoryview
-        if not nbytes:
-            nbytes = len(buffer)
-        total = min(nbytes, self.remaining)
-
-        remaining = total
-        while remaining > 0:
-            done = await self.sock.recv_into(buffer, remaining)
-            if not done:
-                raise ConnectionClosedError(f'connection closed with {remaining:,d} bytes left')
-            self.hasher.update(buffer[:done])
-            buffer = buffer[done:]
-            remaining -= done
-
-        self.remaining -= total
-        return total
-
-
-async def read_exact(recv, size):
-    # Optimize normal case
-    part = await recv(size)
-    if len(part) == size:
-        return part
-    parts = []
-    while part:
-        parts.append(part)
-        size -= len(part)
-        if not size:
-            return b''.join(parts)
-        part = await recv(size)
-    raise ConnectionClosedError(f'connection closed with {size:,d} bytes left')
-
-
-class BitcoinSession:
-
-    def __init__(self, network, peer_address, verbosity):
-        self.peer_address = NetAddress.from_string(peer_address)
-        self.network = network
-        self.verbosity = verbosity
-        self.resolved_address = None
-        self.is_outgoing = False
-        # The chain tracked by our peer
-        self.chain = None
-        self.known_height = 0
-        self.headers_synced = False
-        self.logger = logging.getLogger(f'BS {peer_address}')
-
-    async def connect(self):
-        self.sock = await open_connection(str(self.peer_address.host), self.peer_address.port)
-        self.is_outgoing = True
-        ip_addr, port, *_ = self.sock.getpeername()
-        self.resolved_address = NetAddress(ip_addr, port)
-        self.logger.info(f'connected at {self.resolved_address}')
-
-    async def on_headers(self, headers):
-        '''Pass headers on to coordinator.  Returns a locator to request more headers.'''
-        return await self.coordinator.send_request('headers', headers)
-
-    async def run(self, start_height, initial_locator):
-        await self.connect()
-        protocol = self.network.protocol(self, start_height)
-        await protocol.run(initial_locator)
-
-    async def read_exact(self, size):
-        return await read_exact(self.sock.recv, size)
-
-    async def send_raw(self, message):
-        await self.sock.sendall(message)
-
-
-class InventoryKind(IntEnum):
-    ERROR = 0
-    TX = 1
-    BLOCK = 2
-    # The following occur only in getdata messages.  Invs always use TX or BLOCK.
-    FILTERED_BLOCK = 3
-    COMPACT_BLOCK = 4
-
-
-def getdata_payload(hashes, kind):
-    def parts(hashes, kind):
-        yield pack_varint(len(hashes))
-        kind_bytes = pack_le_uint32(kind)
-        for item_hash in hashes:
-            yield kind_bytes
-            yield item_hash
-
-    return b''.join(parts(hashes, kind))
-
-
-def block_locator_parts(locator, hash_stop):
-    yield pack_le_int32(PROTOCOL_VERSION)
-    yield pack_varint(len(locator))
-    for block_hash in locator:
-        yield block_hash
-    yield hash_stop or bytes(32)
-
-
-def pack_block_locator(locator, hash_stop=None):
-    return b''.join(block_locator_parts(locator, hash_stop))
-
-
-class BitcoinProtocol:
-
-    def __init__(self, session, start_height, *, magic):
-        self.session = session
-        self.magic = magic
-        self.verbosity = session.verbosity
-        self.network = session.network
-        self.logger = session.logger
-
-        # State
-        self.handlers = {}
-        self.our_service = ServiceDetails(
-            service=BitcoinService('[::]:0', 0),
-            user_agent='/seeder:1.0/',
-            protoconf=Protoconf(ATOMIC_PAYLOAD_SIZE, [b'Default']),
-            start_height=start_height,
-        )
-        self.their_service = None
-        self.version_sent = False
-        self.requested_blocks = {}
-
-        # These three coordinate the initial handshake
-        self.send_version_good = Event()
-        self.version_received = Event()
-        self.verack_received = Event()
-
-        self.caught_up_event = Event()
-        self.request_blocks_event = Event()
-
-    def log_service_details(self, serv, headline):
-        self.logger.info(headline)
-        self.logger.info(f'    user_agent={serv.user_agent} '
-                         f'services={ServiceFlags(serv.service.services)!r}')
-        self.logger.info(f'    protocol={serv.version} height={serv.start_height:,d}  '
-                         f'relay={serv.relay} timestamp={serv.timestamp} assoc_id={serv.assoc_id}')
-
-    #
-    # Control
-    #
-
-    def setup_handlers(self, handshake):
-        '''Set up handlers.  If handshake is True then for the initial handshake, otherwise
-        for once the handshake is complete.'''
-        if handshake:
-            self.handlers = {
-                NetMessage.VERSION: self.on_version,
-                NetMessage.PROTOCONF: self.on_protoconf,
-                NetMessage.VERACK: self.on_verack,
-            }
-        else:
-            self.handlers.update({
-                NetMessage.ADDR: self.on_addr,
-                NetMessage.BLOCK: self.on_block,
-                NetMessage.FEEFILTER: self.on_feefilter,
-                NetMessage.HEADERS: self.on_headers,
-                # NetMessage.INV: self.on_inv,
-                NetMessage.PING: self.on_ping,
-                # NetMessage.PONG is handled locally in keep_alive()
-                NetMessage.SENDHEADERS: self.on_sendheaders,
-                NetMessage.SENDCMPCT: self.on_sendcmpct,
-            })
-
-    async def perform_handshake(self):
-        '''Perform the initial handshake.'''
-        await self.send_version()
-        await self.send_verack()
-        await self.verack_received.wait()
-
-    async def post_handshake_messaging(self, initial_locator):
-        await self.send_protoconf()
-        await self.send_message(NetMessage.SENDHEADERS, b'')
-        await self.get_headers(initial_locator)
-
-    async def run(self, initial_locator):
-        if self.session.is_outgoing:
-            await self.send_version_good.set()
-
-        # FIXME: clean this up
-        async with TaskGroup(wait=any) as group:
-            # Set up the handshake handlers and the message processing task so we can
-            # handle responses
-            self.setup_handlers(handshake=True)
-            await group.spawn(self.process_messages)
-
-            # Do the handshake before post-handshake messaging, setting up keep-alive etc.
-            await self.perform_handshake()
-            await self.post_handshake_messaging(initial_locator)
-
-            await group.spawn(self.keep_alive)
-            # await group.spawn(self.sync_blocks)
-
-    async def keep_alive(self, interval=600):
-        '''Send occational pings to keep the connection alive.'''
-        async def on_pong(read):
-            nonlocal ping_nonce
-
-            pong_nonce = read(8)
-            if ping_nonce is None:
-                self.logger.warning('ignoring pong; no ping sent')
-            else:
-                if ping_nonce == pong_nonce:
-                    ping_nonce = None
-                    self.logger.debug('received good pong')
-                else:
-                    self.logger.warning('received bad pong')
-
-        ping_nonce = None
-        self.handlers[NetMessage.PONG] = on_pong
-        while True:
-            ping_nonce = urandom(8)
-            self.logger.debug('sending ping')
-            await self.send_message(NetMessage.PING, ping_nonce)
-            await sleep(interval)
-            if ping_nonce is not None:
-                self.logger.warning('ping sent but pong not received')
-
-    async def get_headers(self, locator):
-        self.logger.debug(f'requesting headers; locator has {len(locator)} entries')
-        await self.send_message(NetMessage.GETHEADERS, pack_block_locator(locator))
-
-    # async def sync_blocks(self):
-    #     await self.caught_up_event.wait()
-    #     while True:
-    #         self.request_blocks_event.clear()
-    #         # FIXME: smarter way to throttle?
-    #         count = 200 - len(self.requested_blocks)
-    #         hashes = self.synchronizer.getblock_hashes(count)
-    #         if hashes:
-    #             self.logger.debug(f'requesting {len(hashes):,d} blocks')
-    #             self.requested_blocks.update(hashes)
-    #             payload = getdata_payload(hashes.keys(), kind=InventoryKind.BLOCK)
-    #             await self.send_message(NetMessage.GETDATA, payload)
-    #         await self.request_blocks_event.wait()
-
-    #
-    # Outgoing messages
-    #
-
-    def build_header(self, command, payload):
-        checksum = double_sha256(payload)[:4]
-        return b''.join((self.magic, command, pack_le_uint32(len(payload)), checksum))
-
-    async def send_message(self, command, payload):
-        '''Send a command and its payload.  Since the message header requires a length and a
-        checksum, we cannot stream messages; the entire payload must be known in
-        advance.
-        '''
-        await self.session.send_raw(self.build_header(command, payload))
-        await self.session.send_raw(payload)
-
-    async def send_version(self):
-        await self.send_version_good.wait()
-        nonce = urandom(8)
-        self.log_service_details(self.our_service, 'sending version message:')
-        payload = self.our_service.version_payload(self.session.resolved_address, nonce)
-        await self.send_message(NetMessage.VERSION, payload)
-        self.version_sent = True
-
-    async def send_verack(self):
-        await self.version_received.wait()
-        self.logger.debug('sending verack message')
-        await self.send_message(NetMessage.VERACK, b'')
-
-    async def send_protoconf(self):
-        await self.send_message(NetMessage.PROTOCONF, self.our_service.protoconf.payload())
-
-    #
-    # Incoming message processing
-    #
-
-    async def process_messages(self):
-        '''Process incoming commands.
-
-        Raises: ConnectionClosedError
-        '''
-        self.logger.debug('processing incoming messages...')
-        while True:
-            try:
-                await self.process_one_message()
-            except struct_error as e:
-                self.logger.error(f'truncated message: {e}')
-            except ProtocolError as e:
-                self.logger.error(f'protocol error: {e}')
-
-    async def process_one_message(self):
-        '''Process a single incoming command.
-
-        Raises: ProtocolError, ConnectionClosedError, UnknownCommandError
-        '''
-        message = NetMessage.from_bytes(await self.session.read_exact(NetMessage.HEADER_SIZE))
-
-        if message.magic != self.magic:
-            raise ProtocolError(f'bad magic: got 0x{message.magic.hex()} '
-                                f'expected 0x{self.magic.hex()}')
-        if self.verbosity:
-            self.logger.debug(f'{message} message with payload size {message.payload_len:,d}')
-
-        reader = PayloadReader(self.session, message)
-        handler = self.handlers.get(message.command_bytes)
-        await reader.handle(handler)
-
-    #
-    # Message receiving
-    #
-
-    async def on_version(self, read):
-        is_duplicate = self.version_received.is_set()
-        if is_duplicate:
-            self.logger.error('duplicate version message received')
-
-        service_details, _our_service, _nonce = ServiceDetails.read(read, self.logger)
-        if not is_duplicate:
-            self.their_service = service_details
-            self.log_service_details(service_details, 'received version message:')
-            await self.version_received.set()
-            await self.send_version_good.set()
-
-    async def on_verack(self, _read):
-        if self.verack_received.is_set():
-            self.logger.error('duplicate verack message received')
-        elif self.version_sent:
-            self.setup_handlers(handshake=False)
-            await self.verack_received.set()
-        else:
-            self.logger.error('verack message received before version message sent')
-
-    async def on_addr(self, read):
-        '''Receive a lits of peer addresses.'''
-        addrs = BitcoinService.read_addrs(read)
-        self.logger.debug(f'read {len(addrs)} peers from ADDR message')
-
-    async def on_ping(self, read):
-        '''Handle an incoming ping by sending a pong with the same 8-byte nonce.'''
-        nonce = read(8)
-        if self.verbosity:
-            self.logger.debug(f'received ping nonce {nonce.hex()}')
-        await self.send_message(NetMessage.PONG, nonce)
-
-    async def on_sendheaders(self, _read):
-        '''The sendheaders message of of no interest to us; we don't announce new blocks.'''
-        # No payload
-        self.logger.debug('ignoring sendheaders message')
-
-    async def on_sendcmpct(self, read):
-        '''The sendcmpct message of of no interest to us; we don't announce new blocks.'''
-        flag = read(1)
-        version = read_le_uint64(read)
-        if flag[0] not in {0, 1}:
-            self.logger.warning(f'unexpected flag byte {flag[0]}')
-        self.logger.debug(f'ignoring sendcmpct message (version is {version:,d})')
-
-    async def on_feefilter(self, read):
-        '''The feefilter message of of no interest to us; ignore it.'''
-        feerate = read_le_int64(read)
-        self.logger.debug(f'ignoring feefilter message; feerate was {feerate:,d}')
-
-    async def on_protoconf(self, read):
-        '''Handle the protoconf message.'''
-        self.their_service.read_protoconf(read, self.logger)
-        # FIXME: maybe create further streams to this peer
-
-    async def on_headers(self, read):
-        '''Handle getting a bunch of headers.'''
-        count = read_varint(read)
-        if count > 2000:
-            self.logger.warning(f'{count:,d} headers in headers message')
-
-        headers = []
-        for _ in range(count):
-            headers.append(read(80))
-            # A stupid tx count which seems to always be zero...
-            read_varint(read)
-
-        locator = await self.session.on_headers(headers)
-        if locator:
-            await self.get_headers(locator)
-        else:
-            await self.caught_up_event.set()
-
-    async def on_inv(self, read):
-        '''Handle getting an inv packet.'''
-        count = read_varint(read)
-        if count > 50_000:
-            self.logger.warning(f'{count:,d} items in inv message')
-        inv = [(read_le_uint32(read), read(32)) for _ in range(count)]
-        block_count = sum(kind == InventoryKind.BLOCK for kind, _hash in inv)
-        self.logger.warning(f'received inv with {block_count:,d}/{len(inv):,d} blocks')
-
-    async def on_block(self, stream):
-        header = await stream.read(80)
-        block_hash = double_sha256(header)
-        block_id = self.requested_blocks.pop(block_hash, None)
-        if block_id is None:
-            self.logger.warning(f'received unrequested block {hash_to_hex_str(block_hash)}')
-            await stream.consume_remainder()
-        else:
-            # await self.block_db.write_block(stream, header)
-            await stream.consume_remainder()
-            await self.request_blocks_event.set()
-
-
 class Protocol:
 
-    def __init__(self, network, is_outgoing, start_height):
+    def __init__(self, network, is_outgoing, start_height, verbosity=0):
+        # Verbosity: 0 (warnings), 1 (info), 2 (debug)
         self.network = network
         self.is_outgoing = is_outgoing
 
@@ -990,307 +577,66 @@ class Protocol:
         )
         self.their_service = None
 
-        # Incoming messages
-        self.unprocessed = []
-        self.unprocessed_len = 0
-        self.need_len = NetMessage.HEADER_SIZE
+        # Outgoing messages
+        self.outgoing_messages = Queue()
 
-        self.version_sent = False
-        self.requested_blocks = {}
-        self.handlers = {}
+        self.logger = logging.getLogger('Protocol')
+        self.verbosity = verbosity
 
-        # These three coordinate the initial handshake
-        self.send_version_good = Event()
-        self.version_received = Event()
-        self.verack_received = Event()
-
-        self.caught_up_event = Event()
-        self.request_blocks_event = Event()
-
-    def log_service_details(self, serv, headline):
-        self.logger.info(headline)
-        self.logger.info(f'    user_agent={serv.user_agent} '
-                         f'services={ServiceFlags(serv.service.services)!r}')
-        self.logger.info(f'    protocol={serv.version} height={serv.start_height:,d}  '
-                         f'relay={serv.relay} timestamp={serv.timestamp} assoc_id={serv.assoc_id}')
+    # def log_service_details(self, serv, headline):
+    #     self.logger.info(headline)
+    #     self.logger.info(f'    user_agent={serv.user_agent} '
+    #                      f'services={ServiceFlags(serv.service.services)!r}')
+    #     self.logger.info(f'    protocol={serv.version} height={serv.start_height:,d}  '
+    #                      f'relay={serv.relay} timestamp={serv.timestamp} assoc_id={serv.assoc_id}')
 
     #
-    # Call this when data is received
+    # Message streaming
     #
-
-    def incoming_data(self, data):
-        self.unprocessed.append(data)
-        self.unprocessed_len += len(data)
-
-    def incoming_message(self):
-        if self.unprocesed_len < self.need_len:
-            return None
-        #
-
-
-    def version_message
-
-
-    #
-    # Control
-    #
-
-    def setup_handlers(self, handshake):
-        '''Set up handlers.  If handshake is True then for the initial handshake, otherwise
-        for once the handshake is complete.'''
-        if handshake:
-            self.handlers = {
-                NetMessage.VERSION: self.on_version,
-                NetMessage.PROTOCONF: self.on_protoconf,
-                NetMessage.VERACK: self.on_verack,
-            }
-        else:
-            self.handlers.update({
-                NetMessage.ADDR: self.on_addr,
-                NetMessage.BLOCK: self.on_block,
-                NetMessage.FEEFILTER: self.on_feefilter,
-                NetMessage.HEADERS: self.on_headers,
-                # NetMessage.INV: self.on_inv,
-                NetMessage.PING: self.on_ping,
-                # NetMessage.PONG is handled locally in keep_alive()
-                NetMessage.SENDHEADERS: self.on_sendheaders,
-                NetMessage.SENDCMPCT: self.on_sendcmpct,
-            })
-
-    async def perform_handshake(self):
-        '''Perform the initial handshake.'''
-        await self.send_version()
-        await self.send_verack()
-        await self.verack_received.wait()
-
-    async def post_handshake_messaging(self, initial_locator):
-        await self.send_protoconf()
-        await self.send_message(NetMessage.SENDHEADERS, b'')
-        await self.get_headers(initial_locator)
-
-    async def run(self, initial_locator):
-        if self.session.is_outgoing:
-            await self.send_version_good.set()
-
-        # FIXME: clean this up
-        async with TaskGroup(wait=any) as group:
-            # Set up the handshake handlers and the message processing task so we can
-            # handle responses
-            self.setup_handlers(handshake=True)
-            await group.spawn(self.process_messages)
-
-            # Do the handshake before post-handshake messaging, setting up keep-alive etc.
-            await self.perform_handshake()
-            await self.post_handshake_messaging(initial_locator)
-
-            await group.spawn(self.keep_alive)
-            # await group.spawn(self.sync_blocks)
-
-    async def keep_alive(self, interval=600):
-        '''Send occational pings to keep the connection alive.'''
-        async def on_pong(read):
-            nonlocal ping_nonce
-
-            pong_nonce = read(8)
-            if ping_nonce is None:
-                self.logger.warning('ignoring pong; no ping sent')
-            else:
-                if ping_nonce == pong_nonce:
-                    ping_nonce = None
-                    self.logger.debug('received good pong')
-                else:
-                    self.logger.warning('received bad pong')
-
-        ping_nonce = None
-        self.handlers[NetMessage.PONG] = on_pong
-        while True:
-            ping_nonce = urandom(8)
-            self.logger.debug('sending ping')
-            await self.send_message(NetMessage.PING, ping_nonce)
-            await sleep(interval)
-            if ping_nonce is not None:
-                self.logger.warning('ping sent but pong not received')
-
-    async def get_headers(self, locator):
-        self.logger.debug(f'requesting headers; locator has {len(locator)} entries')
-        await self.send_message(NetMessage.GETHEADERS, pack_block_locator(locator))
-
-    # async def sync_blocks(self):
-    #     await self.caught_up_event.wait()
-    #     while True:
-    #         self.request_blocks_event.clear()
-    #         # FIXME: smarter way to throttle?
-    #         count = 200 - len(self.requested_blocks)
-    #         hashes = self.synchronizer.getblock_hashes(count)
-    #         if hashes:
-    #             self.logger.debug(f'requesting {len(hashes):,d} blocks')
-    #             self.requested_blocks.update(hashes)
-    #             payload = getdata_payload(hashes.keys(), kind=InventoryKind.BLOCK)
-    #             await self.send_message(NetMessage.GETDATA, payload)
-    #         await self.request_blocks_event.wait()
-
-    #
-    # Outgoing messages
-    #
-
-    def build_header(self, command, payload):
-        checksum = double_sha256(payload)[:4]
-        return b''.join((self.magic, command, pack_le_uint32(len(payload)), checksum))
 
     async def send_message(self, command, payload):
         '''Send a command and its payload.  Since the message header requires a length and a
         checksum, we cannot stream messages; the entire payload must be known in
         advance.
         '''
-        await self.session.send_raw(self.build_header(command, payload))
-        await self.session.send_raw(payload)
+        header = MessageHeader.std_bytes(self.network.magic, command, payload)
+        await self.outgoing_messages.put((header, payload))
 
-    async def send_version(self):
-        await self.send_version_good.wait()
-        nonce = urandom(8)
-        self.log_service_details(self.our_service, 'sending version message:')
-        payload = self.our_service.version_payload(self.session.resolved_address, nonce)
-        await self.send_message(NetMessage.VERSION, payload)
-        self.version_sent = True
+    async def send_streaming_message(self, command, payload_len, parts_func):
+        header = MessageHeader.ext_bytes(self.network.magic, command, payload_len)
+        await self.outgoing_messages.put((header, (payload_len, parts_func)))
 
-    async def send_verack(self):
-        await self.version_received.wait()
-        self.logger.debug('sending verack message')
-        await self.send_message(NetMessage.VERACK, b'')
-
-    async def send_protoconf(self):
-        await self.send_message(NetMessage.PROTOCONF, self.our_service.protoconf.payload())
-
-    #
-    # Incoming message processing
-    #
-
-    async def process_messages(self):
-        '''Process incoming commands.
-
-        Raises: ConnectionClosedError
-        '''
-        self.logger.debug('processing incoming messages...')
+    async def bytes_to_send(self):
+        '''An asynchronous generator of bytes to send over the network.'''
         while True:
-            try:
-                await self.process_one_message()
-            except struct_error as e:
-                self.logger.error(f'truncated message: {e}')
-            except ProtocolError as e:
-                self.logger.error(f'protocol error: {e}')
+            header, payload = await self.outgoing_messages.get()
+            yield header
+            # Streaming payload?
+            if isinstance(payload, tuple):
+                payload_len, get_payload = payload
+                while payload_len > 0:
+                    payload = await get_payload()
+                    payload_len -= len(payload)
+                    yield payload
+            else:
+                yield payload
+            # Release memory
+            payload = None
 
-    async def process_one_message(self):
-        '''Process a single incoming command.
+    async def recv_message(self, read):
+        '''An asynchronous generator of incoming message headers.
 
-        Raises: ProtocolError, ConnectionClosedError, UnknownCommandError
+        The asynchronous function read is called to read bytes from a stream.
+        The caller is responsible for reading the payload from the stream, and validating the
+        checksum if necessary.
         '''
-        message = NetMessage.from_bytes(await self.session.read_exact(NetMessage.HEADER_SIZE))
+        while True:
+            header = await MessageHeader.from_stream(read)
+            if header.magic != self.network.magic:
+                raise ProtocolError(f'bad magic: got 0x{header.magic.hex()} '
+                                    f'expected 0x{self.network.magic.hex()}')
 
-        if message.magic != self.magic:
-            raise ProtocolError(f'bad magic: got 0x{message.magic.hex()} '
-                                f'expected 0x{self.magic.hex()}')
-        if self.verbosity:
-            self.logger.debug(f'{message} message with payload size {message.payload_len:,d}')
+            if self.verbosity >= 2:
+                self.logger.debug(f'{header} message with payload size {header.payload_len:,d}')
 
-        reader = PayloadReader(self.session, message)
-        handler = self.handlers.get(message.command_bytes)
-        await reader.handle(handler)
-
-    #
-    # Message receiving
-    #
-
-    async def on_version(self, read):
-        is_duplicate = self.version_received.is_set()
-        if is_duplicate:
-            self.logger.error('duplicate version message received')
-
-        service_details, _our_service, _nonce = ServiceDetails.read(read, self.logger)
-        if not is_duplicate:
-            self.their_service = service_details
-            self.log_service_details(service_details, 'received version message:')
-            await self.version_received.set()
-            await self.send_version_good.set()
-
-    async def on_verack(self, _read):
-        if self.verack_received.is_set():
-            self.logger.error('duplicate verack message received')
-        elif self.version_sent:
-            self.setup_handlers(handshake=False)
-            await self.verack_received.set()
-        else:
-            self.logger.error('verack message received before version message sent')
-
-    async def on_addr(self, read):
-        '''Receive a lits of peer addresses.'''
-        addrs = BitcoinService.read_addrs(read)
-        self.logger.debug(f'read {len(addrs)} peers from ADDR message')
-
-    async def on_ping(self, read):
-        '''Handle an incoming ping by sending a pong with the same 8-byte nonce.'''
-        nonce = read(8)
-        if self.verbosity:
-            self.logger.debug(f'received ping nonce {nonce.hex()}')
-        await self.send_message(NetMessage.PONG, nonce)
-
-    async def on_sendheaders(self, _read):
-        '''The sendheaders message of of no interest to us; we don't announce new blocks.'''
-        # No payload
-        self.logger.debug('ignoring sendheaders message')
-
-    async def on_sendcmpct(self, read):
-        '''The sendcmpct message of of no interest to us; we don't announce new blocks.'''
-        flag = read(1)
-        version = read_le_uint64(read)
-        if flag[0] not in {0, 1}:
-            self.logger.warning(f'unexpected flag byte {flag[0]}')
-        self.logger.debug(f'ignoring sendcmpct message (version is {version:,d})')
-
-    async def on_feefilter(self, read):
-        '''The feefilter message of of no interest to us; ignore it.'''
-        feerate = read_le_int64(read)
-        self.logger.debug(f'ignoring feefilter message; feerate was {feerate:,d}')
-
-    async def on_protoconf(self, read):
-        '''Handle the protoconf message.'''
-        self.their_service.read_protoconf(read, self.logger)
-        # FIXME: maybe create further streams to this peer
-
-    async def on_headers(self, read):
-        '''Handle getting a bunch of headers.'''
-        count = read_varint(read)
-        if count > 2000:
-            self.logger.warning(f'{count:,d} headers in headers message')
-
-        headers = []
-        for _ in range(count):
-            headers.append(read(80))
-            # A stupid tx count which seems to always be zero...
-            read_varint(read)
-
-        locator = await self.session.on_headers(headers)
-        if locator:
-            await self.get_headers(locator)
-        else:
-            await self.caught_up_event.set()
-
-    async def on_inv(self, read):
-        '''Handle getting an inv packet.'''
-        count = read_varint(read)
-        if count > 50_000:
-            self.logger.warning(f'{count:,d} items in inv message')
-        inv = [(read_le_uint32(read), read(32)) for _ in range(count)]
-        block_count = sum(kind == InventoryKind.BLOCK for kind, _hash in inv)
-        self.logger.warning(f'received inv with {block_count:,d}/{len(inv):,d} blocks')
-
-    async def on_block(self, stream):
-        header = await stream.read(80)
-        block_hash = double_sha256(header)
-        block_id = self.requested_blocks.pop(block_hash, None)
-        if block_id is None:
-            self.logger.warning(f'received unrequested block {hash_to_hex_str(block_hash)}')
-            await stream.consume_remainder()
-        else:
-            # await self.block_db.write_block(stream, header)
-            await stream.consume_remainder()
-            await self.request_blocks_event.set()
+            yield header

@@ -84,6 +84,10 @@ class ForceDisconnectError(Exception):
     '''Raise on an error that must force a disconnection.'''
 
 
+class ConnectionClosedError(Exception):
+    '''Raise when the connection is closed prematurely remotely.'''
+
+
 #
 # Script errors
 #
