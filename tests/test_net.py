@@ -408,3 +408,8 @@ class TestMessageHeader:
         command_bytes = getattr(MessageHeader, command.upper())
         header = MessageHeader(b'', command_bytes, 0, b'', False)
         assert str(header) == command
+
+    def test_commands(self):
+        for key, value in MessageHeader.__dict__.items():
+            if isinstance(value, bytes):
+                assert key.lower().encode() == value.rstrip(b'\0')
