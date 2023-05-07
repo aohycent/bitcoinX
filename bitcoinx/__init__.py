@@ -10,6 +10,7 @@ from .interpreter import *
 from .keys import *
 from .misc import *
 from .mnemonic import *
+from .net import *
 from .packing import *
 from .script import *
 from .signature import *
@@ -32,6 +33,7 @@ __all__ = sum((
     keys.__all__,
     misc.__all__,
     mnemonic.__all__,
+    net.__all__,
     packing.__all__,
     script.__all__,
     signature.__all__,

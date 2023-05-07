@@ -23,137 +23,19 @@ from .packing import (
 )
 
 
-# Standard and extended message hedaers
-std_header_struct = Struct('<4s12sI4s')
-ext_header_struct = Struct('<4s12sI4s12sQ')
-ext_extra_struct = Struct('<12sQ')
+__all__ = (
+    'is_valid_hostname', 'classify_host', 'validate_port', 'validate_protocol', 'recv_exact',
+    'NetAddress', 'Service', 'ServicePart', 'MessageHeader',
+)
 
-# This is the maximum payload length a non-streaming command can accept.  Such
-# payloads are buffered and processed as a unit by the handler.
-ATOMIC_PAYLOAD_SIZE = 2_000_000
-PROTOCOL_VERSION = 70015
-
-
-class ServiceFlags(IntFlag):
-    NODE_NONE = 0
-    NODE_NETWORK = 1 << 0
-    NODE_GETUTXO = 1 << 1
-    NODE_BLOOM = 1 << 2
-
-
-class InventoryKind(IntEnum):
-    ERROR = 0
-    TX = 1
-    BLOCK = 2
-    # The following occur only in getdata messages.  Invs always use TX or BLOCK.
-    FILTERED_BLOCK = 3
-    COMPACT_BLOCK = 4
-
+#
+# Miscellaneous handy networking utility functions
+#
 
 class ServicePart(IntEnum):
     PROTOCOL = 0
     HOST = 1
     PORT = 2
-
-
-async def recv_exact(recv, size):
-    '''Asynchronously read exactly size bytes using read().
-    Raises: ConnectionClosedError.'''
-    # Optimize normal case
-    part = await recv(size)
-    if len(part) == size:
-        return part
-    parts = []
-    while part:
-        parts.append(part)
-        size -= len(part)
-        if not size:
-            return b''.join(parts)
-        part = await recv(size)
-    raise ConnectionClosedError(f'connection closed with {size:,d} bytes left')
-
-
-@attr.s(slots=True)
-class MessageHeader:
-    '''The header of a network protocol message.'''
-
-    # Extended headers were introduced in the BSV 1.0.10 node software.
-
-    COMMAND_LEN = 12
-    STD_HEADER_SIZE = std_header_struct.size
-    EXT_HEADER_SIZE = ext_header_struct.size
-
-    magic = attr.ib()
-    command_bytes = attr.ib()
-    payload_len = attr.ib()
-    checksum = attr.ib()
-    is_extended = attr.ib()
-
-    @classmethod
-    async def from_stream(cls, recv):
-        raw_std = await recv_exact(recv, cls.STD_HEADER_SIZE)
-        magic, command, payload_len, checksum = std_header_struct.unpack(raw_std)
-        is_extended = False
-        if command == cls.EXTMSG:
-            raw_ext = await recv_exact(recv, cls.EXT_HEADER_SIZE - cls.STD_HEADER_SIZE)
-            command, payload_len = ext_extra_struct.unpack(raw_ext)
-            is_extended = True
-        return cls(magic, command, payload_len, checksum, is_extended)
-
-    def __str__(self):
-        '''The message command as text (or a hex representation if not ASCII).'''
-        command = self.command_bytes.rstrip(b'\0')
-        return command.decode() if command.isascii() else '0x' + command.hex()
-
-    @classmethod
-    def std_bytes(cls, magic, command, payload):
-        return std_header_struct.pack(
-            magic, command, len(payload), double_sha256(payload)[:4]
-        )
-
-    @classmethod
-    def ext_bytes(cls, magic, command, payload_len):
-        return ext_header_struct.pack(
-            magic, cls.EXTMSG, 0xffffffff, bytes(4), command, payload_len
-        )
-
-
-def _command(text):
-    return text.encode().ljust(MessageHeader.COMMAND_LEN, b'\0')
-
-
-# List these explicitly because pylint is dumb
-MessageHeader.ADDR = _command('addr')
-MessageHeader.BLOCK = _command('block')
-MessageHeader.BLOCKTXN = _command('blocktxn')
-MessageHeader.CMPCTBLOCK = _command('cmpctblock')
-MessageHeader.CREATESTRM = _command('createstrm')
-MessageHeader.EXTMSG = _command('extmsg')
-MessageHeader.FEEFILTER = _command('feefilter')
-MessageHeader.FILTERADD = _command('filteradd')
-MessageHeader.FILTERCLEAR = _command('filterclear')
-MessageHeader.FILTERLOAD = _command('filterload')
-MessageHeader.GETADDR = _command('getaddr')
-MessageHeader.GETBLOCKS = _command('getblocks')
-MessageHeader.GETBLOCKTXN = _command('getblocktxn')
-MessageHeader.GETDATA = _command('getdata')
-MessageHeader.GETHEADERS = _command('getheaders')
-MessageHeader.HEADERS = _command('headers')
-MessageHeader.INV = _command('inv')
-MessageHeader.MEMPOOL = _command('mempool')
-MessageHeader.MERKELBLOCK = _command('merkleblock')
-MessageHeader.NOTFOUND = _command('notfound')
-MessageHeader.PING = _command('ping')
-MessageHeader.PONG = _command('pong')
-MessageHeader.PROTOCONF = _command('protoconf')
-MessageHeader.REJECT = _command('reject')
-MessageHeader.REPLY = _command('reply')
-MessageHeader.SENDCMPCT = _command('sendcmpct')
-MessageHeader.SENDHEADERS = _command('sendheaders')
-MessageHeader.STREAMACK = _command('streamack')
-MessageHeader.TX = _command('tx')
-MessageHeader.VERACK = _command('verack')
-MessageHeader.VERSION = _command('version')
 
 
 # See http://stackoverflow.com/questions/2532053/validate-a-hostname-string
@@ -211,7 +93,7 @@ def validate_port(port):
 
 
 def validate_protocol(protocol):
-    '''Validate a protocol, a string, and return it.'''
+    '''Validate a protocol, a string, and return it in lower case.'''
     if not re.match(PROTOCOL_REGEX, protocol):
         raise ValueError(f'invalid protocol: {protocol}')
     return protocol.lower()
@@ -229,6 +111,23 @@ def _split_address(string):
     if colon == -1:
         return string, ''
     return string[:colon], string[colon + 1:]
+
+
+async def recv_exact(recv, size):
+    '''Asynchronously read exactly size bytes using recv().
+    Raises: ConnectionClosedError.'''
+    # Optimize normal case
+    part = await recv(size)
+    if len(part) == size:
+        return part
+    parts = []
+    while part:
+        parts.append(part)
+        size -= len(part)
+        if not size:
+            return b''.join(parts)
+        part = await recv(size)
+    raise ConnectionClosedError(f'connection closed with {size:,d} bytes left')
 
 
 class NetAddress:
@@ -376,6 +275,122 @@ class Service:
 
     def __repr__(self):
         return f"Service({self._protocol!r}, '{self._address}')"
+
+#
+# Constants and classes implementing the Bitcoin network protocol
+#
+
+# Standard and extended message hedaers
+std_header_struct = Struct('<4s12sI4s')
+std_pack = std_header_struct.pack
+std_unpack = std_header_struct.unpack
+ext_header_struct = Struct('<4s12sI4s12sQ')
+ext_pack = ext_header_struct.pack
+ext_extra_struct = Struct('<12sQ')
+ext_extra_unpack = ext_extra_struct.unpack
+empty_checksum = bytes(4)
+
+# This is the maximum payload length a non-streaming command can accept.  Such
+# payloads are buffered and processed as a unit by the handler.
+ATOMIC_PAYLOAD_SIZE = 2_000_000
+PROTOCOL_VERSION = 70015
+
+
+class ServiceFlags(IntFlag):
+    NODE_NONE = 0
+    NODE_NETWORK = 1 << 0
+    NODE_GETUTXO = 1 << 1
+    NODE_BLOOM = 1 << 2
+
+
+class InventoryKind(IntEnum):
+    ERROR = 0
+    TX = 1
+    BLOCK = 2
+    # The following occur only in getdata messages.  Invs always use TX or BLOCK.
+    FILTERED_BLOCK = 3
+    COMPACT_BLOCK = 4
+
+
+@attr.s(slots=True)
+class MessageHeader:
+    '''The header of a network protocol message.'''
+
+    # Extended headers were introduced in the BSV 1.0.10 node software.
+
+    COMMAND_LEN = 12
+    STD_HEADER_SIZE = std_header_struct.size
+    EXT_HEADER_SIZE = ext_header_struct.size
+
+    magic = attr.ib()
+    command = attr.ib()      # bytes
+    payload_len = attr.ib()
+    checksum = attr.ib()
+    is_extended = attr.ib()
+
+    @classmethod
+    async def from_stream(cls, recv):
+        raw_std = await recv_exact(recv, cls.STD_HEADER_SIZE)
+        magic, command, payload_len, checksum = std_unpack(raw_std)
+        is_extended = False
+        if command == cls.EXTMSG:
+            if checksum != empty_checksum or payload_len != 0xffffffff:
+                raise ProtocolError('ill-formed extended message header')
+            raw_ext = await recv_exact(recv, cls.EXT_HEADER_SIZE - cls.STD_HEADER_SIZE)
+            command, payload_len = ext_extra_unpack(raw_ext)
+            is_extended = True
+        return cls(magic, command, payload_len, checksum, is_extended)
+
+    def __str__(self):
+        '''The message command as text (or a hex representation if not ASCII).'''
+        command = self.command.rstrip(b'\0')
+        return command.decode() if command.isascii() else '0x' + command.hex()
+
+    @classmethod
+    def std_bytes(cls, magic, command, payload):
+        return std_pack(magic, command, len(payload), double_sha256(payload)[:4])
+
+    @classmethod
+    def ext_bytes(cls, magic, command, payload_len):
+        return ext_pack(magic, cls.EXTMSG, 0xffffffff, empty_checksum, command, payload_len)
+
+
+def _command(text):
+    return text.encode().ljust(MessageHeader.COMMAND_LEN, b'\0')
+
+
+# List these explicitly because pylint is dumb
+MessageHeader.ADDR = _command('addr')
+MessageHeader.BLOCK = _command('block')
+MessageHeader.BLOCKTXN = _command('blocktxn')
+MessageHeader.CMPCTBLOCK = _command('cmpctblock')
+MessageHeader.CREATESTRM = _command('createstrm')
+MessageHeader.EXTMSG = _command('extmsg')
+MessageHeader.FEEFILTER = _command('feefilter')
+MessageHeader.FILTERADD = _command('filteradd')
+MessageHeader.FILTERCLEAR = _command('filterclear')
+MessageHeader.FILTERLOAD = _command('filterload')
+MessageHeader.GETADDR = _command('getaddr')
+MessageHeader.GETBLOCKS = _command('getblocks')
+MessageHeader.GETBLOCKTXN = _command('getblocktxn')
+MessageHeader.GETDATA = _command('getdata')
+MessageHeader.GETHEADERS = _command('getheaders')
+MessageHeader.HEADERS = _command('headers')
+MessageHeader.INV = _command('inv')
+MessageHeader.MEMPOOL = _command('mempool')
+MessageHeader.MERKELBLOCK = _command('merkleblock')
+MessageHeader.NOTFOUND = _command('notfound')
+MessageHeader.PING = _command('ping')
+MessageHeader.PONG = _command('pong')
+MessageHeader.PROTOCONF = _command('protoconf')
+MessageHeader.REJECT = _command('reject')
+MessageHeader.REPLY = _command('reply')
+MessageHeader.SENDCMPCT = _command('sendcmpct')
+MessageHeader.SENDHEADERS = _command('sendheaders')
+MessageHeader.STREAMACK = _command('streamack')
+MessageHeader.TX = _command('tx')
+MessageHeader.VERACK = _command('verack')
+MessageHeader.VERSION = _command('version')
 
 
 class BitcoinService:
@@ -634,9 +649,9 @@ class Protocol:
 
     async def handle_message(self, header):
         if not self.verack_received.is_set():
-            if header.command_bytes not in (MessageHeader.VERSION, MessageHeader.VERACK):
+            if header.command not in (MessageHeader.VERSION, MessageHeader.VERACK):
                 raise ProtocolError(f'{header} command received before handshake finished')
-        handler = self.handlers.get(header.command_bytes)
+        handler = self.handlers.get(header.command)
         if not handler:
             self.logger.debug(f'ignoring unhandled {header} command')
             return
