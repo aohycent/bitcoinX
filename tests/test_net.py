@@ -1,12 +1,12 @@
 import os
 import random
+from io import BytesIO
 from ipaddress import IPv4Address, IPv6Address
 
 import pytest
 
-from bitcoinx import Bitcoin, double_sha256, Headers
+from bitcoinx import Bitcoin, double_sha256, Headers, pack_varint
 from bitcoinx.net import *
-from bitcoinx.net import Stream
 from bitcoinx.errors import ConnectionClosedError, ProtocolError
 
 
@@ -78,6 +78,43 @@ def test_classify_host_bad_type(host):
 def test_classify_host_bad(host):
     with pytest.raises(ValueError):
         classify_host(host)
+
+@pytest.mark.parametrize("port,answer", (
+    ('2', 2),
+    (65535, 65535),
+    (0, ValueError),
+    (-1, ValueError),
+    (65536, ValueError),
+    (b'', TypeError),
+    (2.0, TypeError),
+    ('2a', ValueError),
+))
+def test_validate_port(port, answer):
+    if isinstance(answer, type) and issubclass(answer, Exception):
+        with pytest.raises(answer):
+            validate_port(port)
+    else:
+        assert validate_port(port) == answer
+
+
+@pytest.mark.parametrize("protocol,answer", (
+    ('TCP', 'tcp'),
+    ('http', 'http'),
+    ('Ftp.-xbar+', 'ftp.-xbar+'),
+    (b'', TypeError),
+    (2, TypeError),
+    ('', ValueError),
+    ('a@b', ValueError),
+    ('a:b', ValueError),
+    ('[23]', ValueError),
+))
+def test_validate_protocol(protocol, answer):
+    if isinstance(answer, type) and issubclass(answer, Exception):
+        with pytest.raises(answer):
+            validate_protocol(protocol)
+    else:
+        assert validate_protocol(protocol) == answer
+
 
 class TestNetAddress:
 
@@ -268,41 +305,120 @@ class TestService:
         setattr(service, 'foo', '')
 
 
-@pytest.mark.parametrize("port,answer", (
-    ('2', 2),
-    (65535, 65535),
-    (0, ValueError),
-    (-1, ValueError),
-    (65536, ValueError),
-    (b'', TypeError),
-    (2.0, TypeError),
-    ('2a', ValueError),
-))
-def test_validate_port(port, answer):
-    if isinstance(answer, type) and issubclass(answer, Exception):
-        with pytest.raises(answer):
-            validate_port(port)
-    else:
-        assert validate_port(port) == answer
+pack_tests = (
+    ('[1a00:23c6:cf86:6201:3cc8:85d1:c41f:9bf6]:8333', BitcoinService.Flags.NODE_NONE,
+     bytes(8) + b'\x1a\x00#\xc6\xcf\x86b\x01<\xc8\x85\xd1\xc4\x1f\x9b\xf6 \x8d'),
+    ('1.2.3.4:56', BitcoinService.Flags.NODE_NETWORK,
+     b'\1' + bytes(17) + b'\xff\xff\1\2\3\4\0\x38'),
+)
+
+pack_ts_tests = (
+    ('[1a00:23c6:cf86:6201:3cc8:85d1:c41f:9bf6]:8333', BitcoinService.Flags.NODE_NETWORK,
+     123456789,'15cd5b0701000000000000001a0023c6cf8662013cc885d1c41f9bf6208d'),
+    ('100.101.102.103:104', BitcoinService.Flags.NODE_NONE, 987654321,
+     'b168de3a000000000000000000000000000000000000ffff646566670068'),
+)
 
 
-@pytest.mark.parametrize("protocol,answer", (
-    ('TCP', 'tcp'),
-    ('http', 'http'),
-    ('Ftp.-xbar+', 'ftp.-xbar+'),
-    (b'', TypeError),
-    (2, TypeError),
-    ('', ValueError),
-    ('a@b', ValueError),
-    ('a:b', ValueError),
-    ('[23]', ValueError),
-))
-def test_validate_protocol(protocol, answer):
-    if isinstance(answer, type) and issubclass(answer, Exception):
-        with pytest.raises(answer):
-            validate_protocol(protocol)
-    else:
-        assert validate_protocol(protocol) == answer
+class TestBitcoinService:
+
+    def test_constructor_bad(self):
+        with pytest.raises(ValueError):
+            BitcoinService('foo.bar:2', BitcoinService.Flags.NODE_NONE)
+
+    def test_eq(self):
+        assert BitcoinService(NetAddress('1.2.3.4', 35), BitcoinService.Flags.NODE_NETWORK) == \
+            BitcoinService('1.2.3.4:35', BitcoinService.Flags.NODE_NETWORK)
+        assert BitcoinService('1.2.3.4:35', BitcoinService.Flags.NODE_NETWORK) != \
+            BitcoinService('1.2.3.4:36', BitcoinService.Flags.NODE_NETWORK)
+        assert BitcoinService(NetAddress('1.2.3.4', 35), BitcoinService.Flags.NODE_NETWORK) != \
+            BitcoinService(NetAddress('1.2.3.5', 35), BitcoinService.Flags.NODE_NETWORK)
+        assert BitcoinService('1.2.3.4:35', BitcoinService.Flags.NODE_NETWORK) != \
+            BitcoinService('1.2.3.5:35', BitcoinService.Flags.NODE_NONE)
+
+    def test_hashable(self):
+        assert 1 == len({BitcoinService('1.2.3.5:35', BitcoinService.Flags.NODE_NONE),
+                         BitcoinService('1.2.3.5:35', BitcoinService.Flags.NODE_NONE)})
+
+    @pytest.mark.parametrize('address,services,result', pack_tests)
+    def test_pack(self, address, services, result):
+        assert BitcoinService(address, services).pack() == result
+
+    @pytest.mark.parametrize('address,services,ts,result', pack_ts_tests)
+    def test_pack_with_timestamp(self, address, services, ts, result):
+        assert BitcoinService(address, services).pack_with_timestamp(ts) == bytes.fromhex(result)
+
+    @pytest.mark.parametrize('address,services,result', pack_tests)
+    def test_unpack(self, address, services, result):
+        assert BitcoinService.unpack(result) == BitcoinService(address, services)
+
+    @pytest.mark.parametrize('address,services,result', pack_tests)
+    def test_read(self, address, services, result):
+        assert BitcoinService.read(BytesIO(result).read) == BitcoinService(address, services)
+
+    @pytest.mark.parametrize('address,services,ts,result', pack_ts_tests)
+    def test_read_with_timestamp(self, address, services, ts, result):
+        read = BytesIO(bytes.fromhex(result)).read
+        service, timestamp = BitcoinService.read_with_timestamp(read)
+        assert ts == timestamp
+        assert service == BitcoinService(address, services)
+
+    def test_read_addrs(self):
+        raw = bytearray()
+        raw += pack_varint(len(pack_ts_tests))
+        for address, flags, ts, packed in pack_ts_tests:
+            raw += bytes.fromhex(packed)
+        result = BitcoinService.read_addrs(BytesIO(raw).read)
+        assert len(result) == len(pack_ts_tests)
+        for n, (service, ts) in enumerate(result):
+            address, flags, timestamp, packed = pack_ts_tests[n]
+            assert ts == timestamp
+            assert service == BitcoinService(address, flags)
+
+    def test_str_repr(self):
+        service = BitcoinService('1.2.3.4:5', 1)
+        assert str(service) == '1.2.3.4:5 <Flags.NODE_NETWORK: 1>'
+        assert repr(service) == "BitcoinService('1.2.3.4:5', <Flags.NODE_NETWORK: 1>)"
+
+
+protoconf_tests = [
+    (2_000_000, [b'foo', b'bar'], '0280841e0007666f6f2c626172'),
+]
+
+class TestProtoconf:
+
+    @pytest.mark.parametrize('max_payload', (Protoconf.LEGACY_MAX_PAYLOAD, 10_000_000))
+    def test_max_inv_elements(self, max_payload):
+        assert Protoconf(max_payload, b'').max_inv_elements() == (max_payload - 9) // (4 + 32)
+
+    @pytest.mark.parametrize('max_payload, policies, result', protoconf_tests)
+    def test_payload(self, max_payload, policies, result):
+        assert Protoconf(max_payload, policies).payload() == bytes.fromhex(result)
+
+    @pytest.mark.parametrize('max_payload, policies, result', protoconf_tests)
+    def test_read(self, max_payload, policies, result):
+        pc = Protoconf.read(BytesIO(bytes.fromhex(result)).read)
+        assert pc.max_payload == max_payload
+        assert pc.stream_policies == policies
+
+    @pytest.mark.parametrize('N', (0, 1))
+    def test_bad_field_count(self, N):
+        raw = bytearray(Protoconf(2_000_000, [b'Default']).payload())
+        raw[0] = N
+        with pytest.raises(ProtocolError):
+            Protoconf.read(BytesIO(raw).read)
+
+    def test_bad_max_payload(self):
+        raw = Protoconf(Protoconf.LEGACY_MAX_PAYLOAD - 1, [b'Default']).payload()
+        with pytest.raises(ProtocolError):
+            Protoconf.read(BytesIO(raw).read)
+
+    def test_logging(self, caplog):
+        raw = bytearray(Protoconf(2_000_000, [b'Default']).payload())
+        raw[0] = 3
+        with caplog.at_level('WARNING'):
+            Protoconf.read(BytesIO(raw).read)
+        assert 'unexpected field count' in caplog.text
 
 
 class Dribble:

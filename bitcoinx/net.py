@@ -25,12 +25,14 @@ from .packing import (
 
 __all__ = (
     'is_valid_hostname', 'classify_host', 'validate_port', 'validate_protocol',
-    'NetAddress', 'Service', 'ServicePart', 'MessageHeader', 'Connection', 'Stream',
+    'NetAddress', 'Service', 'ServicePart', 'BitcoinService', 'Protoconf',
+    'MessageHeader', 'Connection', 'Stream',
 )
 
 #
 # Miscellaneous handy networking utility functions
 #
+
 
 class ServicePart(IntEnum):
     PROTOCOL = 0
@@ -161,7 +163,7 @@ class NetAddress:
         return f'{self.host}:{self.port}'
 
     def __repr__(self):
-        return f'NetAddress({self.host!r}, {self.port})'
+        return f"NetAddress('{self}')"
 
     @classmethod
     def default_host_and_port(cls, host, port):
@@ -293,7 +295,6 @@ class Stream:
     #         residual = memoryview(chunk[consumed:])
 
 
-
 #
 # Constants and classes implementing the Bitcoin network protocol
 #
@@ -312,13 +313,6 @@ empty_checksum = bytes(4)
 # payloads are buffered and processed as a unit by the handler.
 ATOMIC_PAYLOAD_SIZE = 2_000_000
 PROTOCOL_VERSION = 70015
-
-
-class ServiceFlags(IntFlag):
-    NODE_NONE = 0
-    NODE_NETWORK = 1 << 0
-    NODE_GETUTXO = 1 << 1
-    NODE_BLOOM = 1 << 2
 
 
 class InventoryKind(IntEnum):
@@ -393,9 +387,6 @@ MessageHeader.DATAREFTX = _command('datareftx')
 MessageHeader.DSDETECTED = _command('dsdetected')
 MessageHeader.EXTMSG = _command('extmsg')
 MessageHeader.FEEFILTER = _command('feefilter')
-MessageHeader.FILTERADD = _command('filteradd')
-MessageHeader.FILTERCLEAR = _command('filterclear')
-MessageHeader.FILTERLOAD = _command('filterload')
 MessageHeader.GETADDR = _command('getaddr')
 MessageHeader.GETBLOCKS = _command('getblocks')
 MessageHeader.GETBLOCKTXN = _command('getblocktxn')
@@ -431,11 +422,18 @@ class BitcoinService:
     '''
     struct = Struct('<Q16s2s')
 
+    class Flags(IntFlag):
+        NODE_NONE = 0
+        NODE_NETWORK = 1 << 0
+        # All other flags are obsolete
+
     def __init__(self, address, services):
         if not isinstance(address, NetAddress):
-            address = NetAddress.from_string(address, check_port=False)
+            address = NetAddress.from_string(address)
+        if not isinstance(address.host, (IPv4Address, IPv6Address)):
+            raise ValueError('BitcoinService requires an IP address')
         self.address = address
-        self.services = services
+        self.services = self.Flags(services)
 
     def __eq__(self, other):
         return (isinstance(other, BitcoinService) and
@@ -486,16 +484,16 @@ class BitcoinService:
         return [cls.read_with_timestamp(read) for _ in range(count)]
 
     def __str__(self):
-        return f'{self.address} {ServiceFlags(self.services)!r}'
+        return f'{self.address} {self.services!r}'
 
     def __repr__(self):
-        return f'BitcoinService({self.address!r}, {ServiceFlags(self.services)!r})'
+        return f"BitcoinService('{self.address}', {self.services!r})"
 
 
-@attr.s(slots=True, repr=True)
+@attr.s(repr=True)
 class Protoconf:
     LEGACY_MAX_PAYLOAD = 1024 * 1024
-    # Instance attributes
+
     max_payload = attr.ib()
     stream_policies = attr.ib()
 
@@ -511,20 +509,20 @@ class Protoconf:
         ))
 
     @classmethod
-    def read(cls, read, logger):
+    def read(cls, read, logger=None):
+        logger = logger or logging
+
         field_count = read_varint(read)
+        if field_count < 2:
+            raise ProtocolError('bad field count {field_count} in protoconf message')
         if field_count != 2:
             logger.warning('unexpected field count {field_count:,d} in protoconf message')
 
-        max_payload = Protoconf.LEGACY_MAX_PAYLOAD
-        if field_count > 0:
-            max_payload = read_le_uint32(read)
-            if max_payload < Protoconf.LEGACY_MAX_PAYLOAD:
-                raise ProtocolError(f'invalid max payload {max_payload:,d} in protconf message')
+        max_payload = read_le_uint32(read)
+        if max_payload < Protoconf.LEGACY_MAX_PAYLOAD:
+            raise ProtocolError(f'invalid max payload {max_payload:,d} in protconf message')
 
-        stream_policies = b'Default'
-        if field_count > 1:
-            stream_policies = read_varbytes(read)
+        stream_policies = read_varbytes(read)
         return Protoconf(max_payload, stream_policies.split(b','))
 
 
@@ -609,12 +607,12 @@ class ServiceDetails:
 
 class Connection:
 
-    def __init__(self, headers, send, recv, net_address, is_outgoing, handlers, verbosity=0):
+    def __init__(self, headers, send, stream, net_address, is_outgoing, handlers, verbosity=0):
         '''net_address is a resolved NetAddress object.'''
         # Verbosity: 0 (warnings), 1 (info), 2 (debug)
         self.headers = headers
         self.send = send
-        self.recv = recv
+        self.stream = stream
         self.net_address = net_address
         self.is_outgoing = is_outgoing
         self.handlers = self.add_default_handlers(handlers)
@@ -644,7 +642,7 @@ class Connection:
     def log_service_details(self, serv, headline):
         self.logger.info(headline)
         self.logger.info(f'    user_agent={serv.user_agent} '
-                         f'services={ServiceFlags(serv.service.services)!r}')
+                         f'services={serv.service.services!r}')
         self.logger.info(f'    protocol={serv.version} height={serv.start_height:,d}  '
                          f'relay={serv.relay} timestamp={serv.timestamp} assoc_id={serv.assoc_id}')
 
@@ -667,7 +665,7 @@ class Connection:
         the payload from the stream, and validating the checksum if necessary.
         '''
         while True:
-            header = await MessageHeader.from_stream(self.recv)
+            header = await MessageHeader.from_stream(self.stream)
             if header.magic != self.network_magic:
                 raise ProtocolError(f'bad magic: got 0x{header.magic.hex()} '
                                     f'expected 0x{self.network_magic.hex()}')
@@ -685,7 +683,7 @@ class Connection:
         if header.is_extended:
             handler = self.handlers.get(header.command + b'X')
             if handler:
-                await handler(self.recv, header.payload_len)
+                await handler(self.stream, header.payload_len)
                 return
 
         # FIXME: handle large payloads in a streaming fashion
