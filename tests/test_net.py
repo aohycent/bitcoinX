@@ -4,8 +4,9 @@ from ipaddress import IPv4Address, IPv6Address
 
 import pytest
 
-from bitcoinx import Bitcoin, double_sha256
+from bitcoinx import Bitcoin, double_sha256, Headers
 from bitcoinx.net import *
+from bitcoinx.net import Stream
 from bitcoinx.errors import ConnectionClosedError, ProtocolError
 
 
@@ -311,34 +312,51 @@ class Dribble:
         self.raw = raw
         self.cursor = 0
 
+    def stream(self):
+        return Stream(self.recv)
+
     async def recv(self, size):
         old_cursor = self.cursor
         count = min(random.randrange(0, size) + 1, len(self.raw) - self.cursor)
         self.cursor += count
         return self.raw[old_cursor: old_cursor + count]
 
+    @staticmethod
+    def lengths(total):
+        lengths = []
+        cursor = 0
+        while cursor < total:
+            length = min(random.randrange(1, total // 2), total - cursor)
+            lengths.append(length)
+            cursor += length
+        return lengths
 
-@pytest.mark.parametrize("N", (5, 32, 100))
-@pytest.mark.asyncio
-async def test_recv_exact(N):
-    dribble = Dribble(memoryview(os.urandom(N)))
-    assert dribble.raw == await recv_exact(dribble.recv, N)
+    @staticmethod
+    def parts(raw):
+        parts = []
+        start = 0
+        for length in Dribble.lengths(len(raw)):
+            parts.append(raw[start: start+length])
+            start += length
+        return parts
 
-    dribble.cursor = 0
-    with pytest.raises(ConnectionClosedError):
-        await recv_exact(dribble.recv, N + 1)
 
-    lengths = []
-    cursor = 0
-    while cursor < N:
-        length = min(random.randrange(1, 10), N - cursor)
-        lengths.append(length)
-        cursor += length
+class TestStream:
 
-    dribble.cursor = 0
-    parts = [await recv_exact(dribble.recv, length) for length in lengths]
-    assert b''.join(parts) == dribble.raw
+    @pytest.mark.parametrize("N", (5, 32, 100))
+    @pytest.mark.asyncio
+    async def test_recv_exact(self, N):
+        dribble = Dribble(memoryview(os.urandom(N)))
+        stream = dribble.stream()
+        assert dribble.raw == await stream.recv_exact(N)
 
+        dribble.cursor = 0
+        with pytest.raises(ConnectionClosedError):
+            await stream.recv_exact(N + 1)
+
+        dribble.cursor = 0
+        parts = [await stream.recv_exact(length) for length in Dribble.lengths(N)]
+        assert b''.join(parts) == dribble.raw
 
 
 std_header_tests = [
@@ -375,7 +393,7 @@ class TestMessageHeader:
     @pytest.mark.asyncio
     async def test_from_stream_std(self, magic, command, payload, answer):
         dribble = Dribble(answer)
-        header = await MessageHeader.from_stream(dribble.recv)
+        header = await MessageHeader.from_stream(dribble.stream())
         assert header.magic == magic
         assert header.command == command
         assert header.payload_len == len(payload)
@@ -386,7 +404,7 @@ class TestMessageHeader:
     @pytest.mark.asyncio
     async def test_from_stream_ext(self, magic, command, payload_len, answer):
         dribble = Dribble(answer)
-        header = await MessageHeader.from_stream(dribble.recv)
+        header = await MessageHeader.from_stream(dribble.stream())
         assert header.magic == magic
         assert header.command == command
         assert header.payload_len == payload_len
@@ -401,7 +419,7 @@ class TestMessageHeader:
     async def test_from_stream_ext_bad(self, raw):
         dribble = Dribble(raw)
         with pytest.raises(ProtocolError):
-            await MessageHeader.from_stream(dribble.recv)
+            await MessageHeader.from_stream(dribble.stream())
 
     @pytest.mark.parametrize("command", ('addr', 'ping', 'sendheaders'))
     def test_str(self, command):
@@ -413,3 +431,37 @@ class TestMessageHeader:
         for key, value in MessageHeader.__dict__.items():
             if isinstance(value, bytes):
                 assert key.lower().encode() == value.rstrip(b'\0')
+
+
+class FakeNode:
+
+    def __init__(self, is_outgoing, net_address):
+        self.is_outgoing = is_outgoing
+        self.net_address = net_address
+        self.peer = None
+        self.queue = Queue()
+
+    def connect_to(self, node, headers):
+        self.peer = node
+        return Connection(headers, self.send, self.recv, node.net_address, {})
+
+    async def send(self, raw):
+        put = self.peer.queue
+        for part in Dribble.parts(self, raw):
+            await put(part)
+
+
+def make_headers(network):
+    headers = Headers(network)
+
+
+# class TestProtocol:
+
+#     # Tests: normal handshake both incoming and outgoing
+#     # Tests: receive verack before version, both incoming and outgoing
+#     # Tests: receive anything else before version or verack, both incoming and outgoing
+
+#     def test_handshake(self):
+#         headers = Headers(Bitcoin)
+#         node_a = FakeNode(True, NetAddress('1.2.3.4', 8333))
+#         node_b = FakeNode(True, NetAddress('4.3.2.1', 8334))

@@ -24,8 +24,8 @@ from .packing import (
 
 
 __all__ = (
-    'is_valid_hostname', 'classify_host', 'validate_port', 'validate_protocol', 'recv_exact',
-    'NetAddress', 'Service', 'ServicePart', 'MessageHeader',
+    'is_valid_hostname', 'classify_host', 'validate_port', 'validate_protocol',
+    'NetAddress', 'Service', 'ServicePart', 'MessageHeader', 'Connection', 'Stream',
 )
 
 #
@@ -111,23 +111,6 @@ def _split_address(string):
     if colon == -1:
         return string, ''
     return string[:colon], string[colon + 1:]
-
-
-async def recv_exact(recv, size):
-    '''Asynchronously read exactly size bytes using recv().
-    Raises: ConnectionClosedError.'''
-    # Optimize normal case
-    part = await recv(size)
-    if len(part) == size:
-        return part
-    parts = []
-    while part:
-        parts.append(part)
-        size -= len(part)
-        if not size:
-            return b''.join(parts)
-        part = await recv(size)
-    raise ConnectionClosedError(f'connection closed with {size:,d} bytes left')
 
 
 class NetAddress:
@@ -276,6 +259,41 @@ class Service:
     def __repr__(self):
         return f"Service({self._protocol!r}, '{self._address}')"
 
+
+class Stream:
+
+    def __init__(self, recv):
+        self.recv = recv
+
+    async def recv_exact(self, size):
+        recv = self.recv
+        parts = []
+        while size > 0:
+            part = await recv(size)
+            if not part:
+                raise ConnectionClosedError(f'connection closed with {size:,d} bytes left')
+            parts.append(part)
+            size -= len(part)
+        return b''.join(parts)
+
+    # async def chunks(self, chunk_size, total_size):
+    #     '''Asynchronous generator of chunks.  Caller must send the number of bytes consumed.'''
+    #     remaining = total_size
+    #     residual = b''
+    #     while remaining:
+    #         size = min(remaining - len(residual), chunk_size)
+    #         chunk = await self.recv_exact(size)
+    #         if residual:
+    #             chunk = b''.join((residual, chunk))
+    #         bio = BytesIO(chunk)
+    #         yield bio
+    #         remaining -=
+    #         consumed = bio.tell()
+    #         remaining -= consumed
+    #         residual = memoryview(chunk[consumed:])
+
+
+
 #
 # Constants and classes implementing the Bitcoin network protocol
 #
@@ -329,14 +347,14 @@ class MessageHeader:
     is_extended = attr.ib()
 
     @classmethod
-    async def from_stream(cls, recv):
-        raw_std = await recv_exact(recv, cls.STD_HEADER_SIZE)
+    async def from_stream(cls, stream):
+        raw_std = await stream.recv_exact(cls.STD_HEADER_SIZE)
         magic, command, payload_len, checksum = std_unpack(raw_std)
         is_extended = False
         if command == cls.EXTMSG:
             if checksum != empty_checksum or payload_len != 0xffffffff:
                 raise ProtocolError('ill-formed extended message header')
-            raw_ext = await recv_exact(recv, cls.EXT_HEADER_SIZE - cls.STD_HEADER_SIZE)
+            raw_ext = await stream.recv_exact(cls.EXT_HEADER_SIZE - cls.STD_HEADER_SIZE)
             command, payload_len = ext_extra_unpack(raw_ext)
             is_extended = True
         return cls(magic, command, payload_len, checksum, is_extended)
@@ -346,9 +364,13 @@ class MessageHeader:
         command = self.command.rstrip(b'\0')
         return command.decode() if command.isascii() else '0x' + command.hex()
 
+    @staticmethod
+    def payload_checksum(payload):
+        return double_sha256(payload)[:4]
+
     @classmethod
     def std_bytes(cls, magic, command, payload):
-        return std_pack(magic, command, len(payload), double_sha256(payload)[:4])
+        return std_pack(magic, command, len(payload), cls.payload_checksum(payload))
 
     @classmethod
     def ext_bytes(cls, magic, command, payload_len):
@@ -585,7 +607,7 @@ class ServiceDetails:
         )
 
 
-class Protocol:
+class Connection:
 
     def __init__(self, headers, send, recv, net_address, is_outgoing, handlers, verbosity=0):
         '''net_address is a resolved NetAddress object.'''
@@ -659,16 +681,28 @@ class Protocol:
         if not self.verack_received.is_set():
             if header.command not in (MessageHeader.VERSION, MessageHeader.VERACK):
                 raise ProtocolError(f'{header} command received before handshake finished')
+
+        if header.is_extended:
+            handler = self.handlers.get(header.command + b'X')
+            if handler:
+                await handler(self.recv, header.payload_len)
+                return
+
+        # FIXME: handle large payloads in a streaming fashion
+
+        # Consume the payload
+        payload = await self.stream.recv_exact(header.payload_len)
         handler = self.handlers.get(header.command)
         if not handler:
             self.logger.debug(f'ignoring unhandled {header} command')
             return
-        # FIXME: handle extended headers properly
-        payload = await recv_exact(self.recv, header.payload_len)
-        await handler(payload)
+
+        if not header.is_extended and header.payload_checksum(payload) != header.checksum:
+            raise ProtocolError(f'bad payload chceksum for {header} command')
+        return await handler(payload)
 
     async def send_messages_loop(self):
-        '''Handles sending the queue of messages.  This has all messages except the initial
+        '''Handles sending the queue of messages.  This sends all messages except the initial
         version / verack handshake.
         '''
         await self.perform_handshake()
