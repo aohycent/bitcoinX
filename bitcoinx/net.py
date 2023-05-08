@@ -607,7 +607,8 @@ class ServiceDetails:
 
 class Connection:
 
-    def __init__(self, headers, send, stream, net_address, is_outgoing, handlers, verbosity=0):
+    def __init__(self, headers, send, stream, net_address, is_outgoing, handlers, *,
+                 max_payload_size=ATOMIC_PAYLOAD_SIZE, verbosity=2):
         '''net_address is a resolved NetAddress object.'''
         # Verbosity: 0 (warnings), 1 (info), 2 (debug)
         self.headers = headers
@@ -625,8 +626,8 @@ class Connection:
         # State
         self.our_service = ServiceDetails(
             service=BitcoinService('[::]:0', 0),
-            user_agent='/test:1.0/',
-            protoconf=Protoconf(ATOMIC_PAYLOAD_SIZE, [b'Default']),
+            user_agent='/Z:1.0/',
+            protoconf=Protoconf(max_payload_size, [b'Default']),
             start_height=headers.height,
         )
         self.their_service = None
