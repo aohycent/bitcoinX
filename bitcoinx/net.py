@@ -27,7 +27,7 @@ from .packing import (
 __all__ = (
     'is_valid_hostname', 'classify_host', 'validate_port', 'validate_protocol',
     'NetAddress', 'Service', 'ServicePart', 'BitcoinService', 'Protoconf',
-    'MessageHeader', 'Connection', 'Stream',
+    'MessageHeader', 'Connection', 'Peer', 'Protocol',
 )
 
 #
@@ -263,39 +263,6 @@ class Service:
         return f"Service({self._protocol!r}, '{self._address}')"
 
 
-class Stream:
-
-    def __init__(self, recv):
-        self.recv = recv
-
-    async def recv_exact(self, size):
-        recv = self.recv
-        parts = []
-        while size > 0:
-            part = await recv(size)
-            if not part:
-                raise ConnectionClosedError(f'connection closed with {size:,d} bytes left')
-            parts.append(part)
-            size -= len(part)
-        return b''.join(parts)
-
-    # async def chunks(self, chunk_size, total_size):
-    #     '''Asynchronous generator of chunks.  Caller must send the number of bytes consumed.'''
-    #     remaining = total_size
-    #     residual = b''
-    #     while remaining:
-    #         size = min(remaining - len(residual), chunk_size)
-    #         chunk = await self.recv_exact(size)
-    #         if residual:
-    #             chunk = b''.join((residual, chunk))
-    #         bio = BytesIO(chunk)
-    #         yield bio
-    #         remaining -=
-    #         consumed = bio.tell()
-    #         remaining -= consumed
-    #         residual = memoryview(chunk[consumed:])
-
-
 #
 # Constants and classes implementing the Bitcoin network protocol
 #
@@ -310,9 +277,6 @@ ext_extra_struct = Struct('<12sQ')
 ext_extra_unpack = ext_extra_struct.unpack
 empty_checksum = bytes(4)
 
-# This is the maximum payload length a non-streaming command can accept.  Such
-# payloads are buffered and processed as a unit by the handler.
-ATOMIC_PAYLOAD_SIZE = 2_000_000
 PROTOCOL_VERSION = 70015
 
 
@@ -401,7 +365,6 @@ MessageHeader.HDRSEN = _command('hdrsen')
 MessageHeader.HEADERS = _command('headers')
 MessageHeader.INV = _command('inv')
 MessageHeader.MEMPOOL = _command('mempool')
-MessageHeader.MERKLEBLOCK = _command('merkleblock')
 MessageHeader.NOTFOUND = _command('notfound')
 MessageHeader.PING = _command('ping')
 MessageHeader.PONG = _command('pong')
@@ -609,39 +572,139 @@ class ServiceDetails:
         )
 
 
-class Connection:
+class Peer:
+    '''Handles a single peer.  Can involve several connections in a single association, even
+    to different network addresses.
 
-    def __init__(self, headers, send, stream, their_address, is_outgoing, *,
-                 max_payload_size=ATOMIC_PAYLOAD_SIZE, verbosity=2):
-        '''net_address is a resolved NetAddress object.'''
-        # Verbosity: 0 (warnings), 1 (info), 2 (debug)
+    Logic here is high-level - details of the network protocol are handled at the Protocol
+    level.
+    '''
+
+    def __init__(self, headers, is_outgoing, *,
+                 max_payload_size=2_000_000,
+                 verbosity=2,
+    ):
         self.headers = headers
-        self.send = send
-        self.stream = stream
-        self.their_address = their_address
-        self.is_outgoing = is_outgoing
-        self.verbosity = verbosity
-
-        # Quick access
         self.network = headers.network
-        self.network_magic = self.network.magic
-
-        # State
+        self.is_outgoing = is_outgoing
+        self.max_payload_size = max_payload_size
+        # Verbosity: 0 (warnings), 1 (info), 2 (debug)
+        self.verbosity = verbosity
+        # There can be several streams (connections) in an association.
+        self.streams = {}
+        # Instances of ServiceDetails
+        self.their_service = None
         self.our_service = ServiceDetails(
             service=BitcoinService(NetAddress('::', 0, check_port=False), 0),
-            user_agent='/Z:1.0/',
+            user_agent='/Artemovsk:0.01/',
             protoconf=Protoconf(max_payload_size, [b'Default']),
             start_height=headers.height,
         )
-        self.their_service = None
+
+        # State
         self.version_sent = False
         self.version_received = Event()
         self.verack_received = Event()
 
+    # Call to request various things from the peer
+
+    def get_addr(self):
+        '''Call to request network nodes from the peer.'''
+
+    def get_data(self, items):
+        '''Request various items from the peer.'''
+
+    def get_block(self, block_hash):
+        '''Call to request the block with the given hash.'''
+
+    # Callbacks when certain messages are received.
+
+    def on_addr(self, services):
+        '''Called when an addr message is received.'''
+
+    def on_block(self, raw):
+        '''Called when a block is received.'''
+
+    def on_inv(self, items):
+        '''Called when an inv message is received advertising availability of various objects.'''
+
+    def on_tx(self, raw):
+        '''Called when a tx is received.'''
+
+    def on_version(self, their_service):
+        '''Called when a version message is received.'''
+        assert not self.their_service
+        self.their_service = their_service
+
+
+class ConnectionLogger(logging.LoggerAdapter):
+
+    '''Prepends a connection identifier to a logging message.'''
+    def process(self, msg, kwargs):
+        conn_id = self.extra.get('conn_id', 'unknown')
+        return f'[{conn_id}] {msg}', kwargs
+
+
+    # TODO: AUTHCH AUTHRESP GETBLOCKS DATAREFTX DSDETECTED FEEFILTER MEMPOOL
+    # Lower level: CMPCTBLOCK BLOCKTXN CREATESTRM GETBLOCKTXN GETHEADERS HEADERS
+    #              NOTFOUND PING PONG REJECT PROTOCONF REPLY REVOKEMID SENDCMPCT SENDHEADERS
+    #              STREAMACK HDRSEN SENDHDRSEN GETHDRSEN
+
+
+class Connection:
+
+    def __init__(self, address, recv, send):
+        self.address = address
+        self.recv = recv
+        self.send = send
+
+        # Logging
+        logger = logging.getLogger('C')
+        context = {'conn_id': f'{address}'}
+        self.logger = ConnectionLogger(logger, context)
+
+    async def recv_exact(self, size):
+        recv = self.recv
+        parts = []
+        while size > 0:
+            part = await recv(size)
+            if not part:
+                raise ConnectionClosedError(f'connection closed with {size:,d} bytes left')
+            parts.append(part)
+            size -= len(part)
+        return b''.join(parts)
+
+    # async def chunks(self, chunk_size, total_size):
+    #     '''Asynchronous generator of chunks.  Caller must send the number of bytes consumed.'''
+    #     remaining = total_size
+    #     residual = b''
+    #     while remaining:
+    #         size = min(remaining - len(residual), chunk_size)
+    #         chunk = await self.recv_exact(size)
+    #         if residual:
+    #             chunk = b''.join((residual, chunk))
+    #         bio = BytesIO(chunk)
+    #         yield bio
+    #         remaining -=
+    #         consumed = bio.tell()
+    #         remaining -= consumed
+    #         residual = memoryview(chunk[consumed:])
+
+
+class Protocol:
+
+    def __init__(self, peer, connection):
+        '''net_address is a resolved NetAddress object.'''
+        self.peer = peer
+        self.connection = connection
+
+        # Quick access
+        self.logger = connection.logger
+        self.network_magic = peer.network.magic
+        self.verbosity = self.peer.verbosity
+
         # Outgoing messages
         self.outgoing_messages = Queue()
-
-        self.logger = logging.getLogger('Protocol')
 
     def _log_service_details(self, serv, headline):
         self.logger.info(headline)
@@ -651,22 +714,20 @@ class Connection:
                          f'relay={serv.relay} timestamp={serv.timestamp} assoc_id={serv.assoc_id}')
 
     async def _handle_message(self, header):
-        if not self.verack_received.is_set():
+        if not self.peer.verack_received.is_set():
             if header.command_bytes not in (MessageHeader.VERSION, MessageHeader.VERACK):
                 raise ProtocolError(f'{header} command received before handshake finished')
 
         command = header.command()
 
         if header.is_extended:
-            handler = self.handlers.get(header.command + b'X')
-            if handler:
-                await handler(self.stream, header.payload_len)
-                return
+            # FIXME
+            pass
 
         # FIXME: handle large payloads in a streaming fashion
 
         # Consume the payload
-        payload = await self.stream.recv_exact(header.payload_len)
+        payload = await self.connection.recv_exact(header.payload_len)
         handler = getattr(self, f'on_{command}', None)
         if not handler:
             self.logger.debug(f'ignoring unhandled {command} command')
@@ -682,31 +743,32 @@ class Connection:
 
         async def send_version():
             '''Send a version message.'''
-            nonce = urandom(8)
-            self._log_service_details(self.our_service, 'sending version message:')
+            our_service = self.peer.our_service
+            self._log_service_details(our_service, 'sending version message:')
 
-            payload = self.our_service.version_payload(self.their_address, nonce)
+            payload = our_service.version_payload(self.connection.address, urandom(8))
             header = MessageHeader.std_bytes(self.network_magic, MessageHeader.VERSION, payload)
-            await self.send(header)
-            await self.send(payload)
-            self.version_sent = True
+            await self.connection.send(header)
+            await self.connection.send(payload)
+            self.peer.version_sent = True
 
         async def send_verack():
             header = MessageHeader.std_bytes(self.network_magic, MessageHeader.VERACK, b'')
-            await self.send(header)
+            await self.connection.send(header)
 
-        if self.is_outgoing:
+        if self.peer.is_outgoing:
             await send_version()
-            await self.version_received.wait()
+            await self.peer.version_received.wait()
         else:
             # Incoming connections wait until the version message is received.
-            await self.version_received.wait()
+            await self.peer.version_received.wait()
             await send_version()
         await send_verack()
-        await self.verack_received.wait()
+        await self.peer.verack_received.wait()
 
     #
-    # Message streaming
+    # Message streaming.  Clients must run recv_messages_loop() and send_messages_loop()
+    # concurrently.
     #
 
     async def recv_messages_loop(self):
@@ -716,13 +778,13 @@ class Connection:
         the payload from the stream, and validating the checksum if necessary.
         '''
         while True:
-            header = await MessageHeader.from_stream(self.stream)
+            header = await MessageHeader.from_stream(self.connection)
             if header.magic != self.network_magic:
                 raise ProtocolError(f'bad magic: got 0x{header.magic.hex()} '
                                     f'expected 0x{self.network_magic.hex()}')
 
             if self.verbosity >= 2:
-                self.logger.debug(f'in: {header} message payload {header.payload_len:,d} bytes')
+                self.logger.debug(f'<- {header} payload {header.payload_len:,d} bytes')
 
             try:
                 await self._handle_message(header)
@@ -744,26 +806,27 @@ class Connection:
                     while payload_len > 0:
                         payload = await parts_func()
                         payload_len -= len(payload)
-                        await self.send(payload)
+                        await self.connection.send(payload)
                 else:
-                    await self.send(item)
+                    await self.connection.send(item)
 
     async def on_version(self, payload):
-        if self.version_received.is_set():
+        if self.peer.version_received.is_set():
             raise ProtocolError('duplicate version message received')
-        self.version_received.set()
+        self.peer.version_received.set()
         read = BytesIO(payload).read
-        self.their_service, _our_service, _nonce = ServiceDetails.read(read, self.logger)
-        self._log_service_details(self.their_service, 'received version message:')
+        their_service, _our_service, _nonce = ServiceDetails.read(read, self.logger)
+        self._log_service_details(their_service, 'received version message:')
+        self.peer.on_version(their_service)
 
     async def on_verack(self, payload):
-        if not self.version_sent:
+        if not self.peer.version_sent:
             raise ProtocolError('verack message received before version message sent')
-        if self.verack_received.is_set():
+        if self.peer.verack_received.is_set():
             self.logger.error('duplicate verack message received')
         if payload:
             self.logger.error('verack message has payload')
-        self.verack_received.set()
+        self.peer.verack_received.set()
 
     async def send_message(self, command, payload):
         '''Send a command and its payload.  Since the message header requires a length and a
@@ -773,6 +836,6 @@ class Connection:
         header = MessageHeader.std_bytes(self.network_magic, command, payload)
         await self.outgoing_messages.put((header, payload))
 
-    async def send_stream(self, command, payload_len, parts_func):
-        header = MessageHeader.ext_bytes(self.network_magic, command, payload_len)
-        await self.outgoing_messages.put((header, (payload_len, parts_func)))
+    # async def send_stream(self, command, payload_len, parts_func):
+    #     header = MessageHeader.ext_bytes(self.network_magic, command, payload_len)
+    #     await self.outgoing_messages.put((header, (payload_len, parts_func)))

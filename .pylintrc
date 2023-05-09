@@ -149,6 +149,7 @@ disable=blacklisted-name,
         logging-fstring-interpolation,  # W1203
         protected-access,   # W0212
         consider-using-dict-items,
+        broad-exception-caught,
         fixme,
 
 # Enable the message, report, category or checker with the given id(s). You can

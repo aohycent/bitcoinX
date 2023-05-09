@@ -431,7 +431,7 @@ class Dribble:
         self.cursor = 0
 
     def stream(self):
-        return Stream(self.recv)
+        return Connection('', self.recv, None)
 
     async def recv(self, size):
         old_cursor = self.cursor
@@ -459,7 +459,7 @@ class Dribble:
         return parts
 
 
-class TestStream:
+class TestConnection:
 
     @pytest.mark.parametrize("N", (5, 32, 100))
     @pytest.mark.asyncio
@@ -551,24 +551,22 @@ class TestMessageHeader:
                 assert key.lower().encode() == value.rstrip(b'\0')
 
 
-class FakeNode:
+class FakeNode(Peer):
 
     def __init__(self, is_outgoing, net_address, headers):
-        self.is_outgoing = is_outgoing
+        super().__init__(headers, is_outgoing)
         self.net_address = net_address
-        self.headers = headers
-        self.peer = None
+        self.remote_peer = None
         # Incoming message queue
         self.queue = Queue()
         self.residual = b''
 
-    def connect_to(self, node):
-        self.peer = node
-        return Connection(self.headers, self.send, self.stream(), self.net_address,
-                          self.is_outgoing)
+        #
+        self.connection = Connection(net_address, self.recv, self.send)
+        self.protocol = Protocol(self, self.connection)
 
-    def stream(self):
-        return Stream(self.recv)
+    def connect_to(self, peer):
+        self.remote_peer = peer
 
     async def recv(self, size):
         result = self.residual
@@ -581,7 +579,7 @@ class FakeNode:
         return result[:size]
 
     async def send(self, raw):
-        put = self.peer.queue.put
+        put = self.remote_peer.queue.put
         for part in Dribble.parts(raw):
             await put(part)
 
@@ -597,25 +595,22 @@ class TestProtocol:
         headers = Headers(Bitcoin)
         node_a = FakeNode(True, NetAddress('1.2.3.4', 8333), headers)
         node_b = FakeNode(False, NetAddress('4.3.2.1', 8334), headers)
-
-        conn_a = node_a.connect_to(node_b)
-        conn_b = node_b.connect_to(node_a)
+        node_a.connect_to(node_b)
+        node_b.connect_to(node_a)
+        nodes = (node_a, node_b)
 
         try:
-            rmloops = [create_task(conn.recv_messages_loop()) for conn in (conn_a, conn_b)]
-            handshakes = [create_task(conn._perform_handshake()) for conn in (conn_a, conn_b)]
+            rmloops = [create_task(node.protocol.recv_messages_loop()) for node in nodes]
+            handshakes = [create_task(node.protocol._perform_handshake()) for node in nodes]
 
             for task in handshakes:
                 await task
 
-            for conn in (conn_a, conn_b):
-                assert conn.version_received.is_set()
-                assert conn.verack_received.is_set()
+            for node in nodes:
+                assert node.version_received.is_set()
+                assert node.verack_received.is_set()
         finally:
             for task in handshakes + rmloops:
                 if not task.done():
                     task.cancel()
-                    try:
-                        await task
-                    except:
-                        pass
+            await sleep(0.01)
