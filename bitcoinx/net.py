@@ -10,6 +10,7 @@ import time
 from asyncio import Event, Queue
 from enum import IntEnum, IntFlag
 from functools import partial
+from io import BytesIO
 from ipaddress import ip_address, IPv4Address, IPv6Address
 from os import urandom
 from struct import Struct, error as struct_error
@@ -335,7 +336,7 @@ class MessageHeader:
     EXT_HEADER_SIZE = ext_header_struct.size
 
     magic = attr.ib()
-    command = attr.ib()      # bytes
+    command_bytes = attr.ib()
     payload_len = attr.ib()
     checksum = attr.ib()
     is_extended = attr.ib()
@@ -343,20 +344,23 @@ class MessageHeader:
     @classmethod
     async def from_stream(cls, stream):
         raw_std = await stream.recv_exact(cls.STD_HEADER_SIZE)
-        magic, command, payload_len, checksum = std_unpack(raw_std)
+        magic, command_bytes, payload_len, checksum = std_unpack(raw_std)
         is_extended = False
-        if command == cls.EXTMSG:
+        if command_bytes == cls.EXTMSG:
             if checksum != empty_checksum or payload_len != 0xffffffff:
                 raise ProtocolError('ill-formed extended message header')
             raw_ext = await stream.recv_exact(cls.EXT_HEADER_SIZE - cls.STD_HEADER_SIZE)
-            command, payload_len = ext_extra_unpack(raw_ext)
+            command_bytes, payload_len = ext_extra_unpack(raw_ext)
             is_extended = True
-        return cls(magic, command, payload_len, checksum, is_extended)
+        return cls(magic, command_bytes, payload_len, checksum, is_extended)
+
+    def command(self):
+        '''The command as text, e.g. addr '''
+        command = self.command_bytes.rstrip(b'\0')
+        return command.decode() if command.isascii() else '0x' + command.hex()
 
     def __str__(self):
-        '''The message command as text (or a hex representation if not ASCII).'''
-        command = self.command.rstrip(b'\0')
-        return command.decode() if command.isascii() else '0x' + command.hex()
+        return self.command()
 
     @staticmethod
     def payload_checksum(payload):
@@ -607,16 +611,15 @@ class ServiceDetails:
 
 class Connection:
 
-    def __init__(self, headers, send, stream, net_address, is_outgoing, handlers, *,
+    def __init__(self, headers, send, stream, their_address, is_outgoing, *,
                  max_payload_size=ATOMIC_PAYLOAD_SIZE, verbosity=2):
         '''net_address is a resolved NetAddress object.'''
         # Verbosity: 0 (warnings), 1 (info), 2 (debug)
         self.headers = headers
         self.send = send
         self.stream = stream
-        self.net_address = net_address
+        self.their_address = their_address
         self.is_outgoing = is_outgoing
-        self.handlers = self.add_default_handlers(handlers)
         self.verbosity = verbosity
 
         # Quick access
@@ -625,7 +628,7 @@ class Connection:
 
         # State
         self.our_service = ServiceDetails(
-            service=BitcoinService('[::]:0', 0),
+            service=BitcoinService(NetAddress('::', 0, check_port=False), 0),
             user_agent='/Z:1.0/',
             protoconf=Protoconf(max_payload_size, [b'Default']),
             start_height=headers.height,
@@ -640,20 +643,67 @@ class Connection:
 
         self.logger = logging.getLogger('Protocol')
 
-    def log_service_details(self, serv, headline):
+    def _log_service_details(self, serv, headline):
         self.logger.info(headline)
         self.logger.info(f'    user_agent={serv.user_agent} '
                          f'services={serv.service.services!r}')
         self.logger.info(f'    protocol={serv.version} height={serv.start_height:,d}  '
                          f'relay={serv.relay} timestamp={serv.timestamp} assoc_id={serv.assoc_id}')
 
-    def add_default_handlers(self, handlers):
-        handlers = handlers.copy()
-        for command in 'version verack protoconf ping pong'.split():
-            handler = getattr(self, f'on_{command}', None)
+    async def _handle_message(self, header):
+        if not self.verack_received.is_set():
+            if header.command_bytes not in (MessageHeader.VERSION, MessageHeader.VERACK):
+                raise ProtocolError(f'{header} command received before handshake finished')
+
+        command = header.command()
+
+        if header.is_extended:
+            handler = self.handlers.get(header.command + b'X')
             if handler:
-                handlers[getattr(MessageHeader, command.toupper())] = handler
-        return handlers
+                await handler(self.stream, header.payload_len)
+                return
+
+        # FIXME: handle large payloads in a streaming fashion
+
+        # Consume the payload
+        payload = await self.stream.recv_exact(header.payload_len)
+        handler = getattr(self, f'on_{command}', None)
+        if not handler:
+            self.logger.debug(f'ignoring unhandled {command} command')
+            return
+
+        if not header.is_extended and header.payload_checksum(payload) != header.checksum:
+            raise ProtocolError(f'bad payload chceksum for {header} command')
+        await handler(payload)
+
+    async def _perform_handshake(self):
+        '''Perform the initial handshake.  Send version and verack messages, and wait until a
+        verack is received back.'''
+
+        async def send_version():
+            '''Send a version message.'''
+            nonce = urandom(8)
+            self._log_service_details(self.our_service, 'sending version message:')
+
+            payload = self.our_service.version_payload(self.their_address, nonce)
+            header = MessageHeader.std_bytes(self.network_magic, MessageHeader.VERSION, payload)
+            await self.send(header)
+            await self.send(payload)
+            self.version_sent = True
+
+        async def send_verack():
+            header = MessageHeader.std_bytes(self.network_magic, MessageHeader.VERACK, b'')
+            await self.send(header)
+
+        if self.is_outgoing:
+            await send_version()
+            await self.version_received.wait()
+        else:
+            # Incoming connections wait until the version message is received.
+            await self.version_received.wait()
+            await send_version()
+        await send_verack()
+        await self.verack_received.wait()
 
     #
     # Message streaming
@@ -674,37 +724,16 @@ class Connection:
             if self.verbosity >= 2:
                 self.logger.debug(f'in: {header} message payload {header.payload_len:,d} bytes')
 
-            await self.handle_message(header)
-
-    async def handle_message(self, header):
-        if not self.verack_received.is_set():
-            if header.command not in (MessageHeader.VERSION, MessageHeader.VERACK):
-                raise ProtocolError(f'{header} command received before handshake finished')
-
-        if header.is_extended:
-            handler = self.handlers.get(header.command + b'X')
-            if handler:
-                await handler(self.stream, header.payload_len)
-                return
-
-        # FIXME: handle large payloads in a streaming fashion
-
-        # Consume the payload
-        payload = await self.stream.recv_exact(header.payload_len)
-        handler = self.handlers.get(header.command)
-        if not handler:
-            self.logger.debug(f'ignoring unhandled {header} command')
-            return
-
-        if not header.is_extended and header.payload_checksum(payload) != header.checksum:
-            raise ProtocolError(f'bad payload chceksum for {header} command')
-        return await handler(payload)
+            try:
+                await self._handle_message(header)
+            except Exception:
+                logging.exception('error handling {header} command')
 
     async def send_messages_loop(self):
         '''Handles sending the queue of messages.  This sends all messages except the initial
         version / verack handshake.
         '''
-        await self.perform_handshake()
+        await self._perform_handshake()
 
         while True:
             items = await self.outgoing_messages.get()
@@ -719,45 +748,22 @@ class Connection:
                 else:
                     await self.send(item)
 
-    async def perform_handshake(self):
-        '''Perform the initial handshake.  Send version and verack messages, and wait until a
-        verack is received back.'''
-        await self.send_version()
-        await self.send_verack()
-        await self.verack_received.wait()
-
-    async def send_version(self):
-        '''Send a version message.'''
-        # Incoming connections wait until the version message is received.
-        if not self.is_outgoing:
-            await self.version_received.wait()
-        nonce = urandom(8)
-        self.log_service_details(self.our_service, 'sending version message:')
-
-        payload = self.our_service.version_payload(self.net_address, nonce)
-        header = MessageHeader.std_bytes(self.network_magic, MessageHeader.VERSION, payload)
-        await self.send(header)
-        await self.send(payload)
-        self.version_sent = True
-
-    async def send_verack(self):
-        await self.version_received.wait()
-        header = MessageHeader.std_bytes(self.network_magic, MessageHeader.VERACK, b'')
-        await self.send(header)
-
     async def on_version(self, payload):
-        pass
+        if self.version_received.is_set():
+            raise ProtocolError('duplicate version message received')
+        self.version_received.set()
+        read = BytesIO(payload).read
+        self.their_service, _our_service, _nonce = ServiceDetails.read(read, self.logger)
+        self._log_service_details(self.their_service, 'received version message:')
 
     async def on_verack(self, payload):
         if not self.version_sent:
             raise ProtocolError('verack message received before version message sent')
-
         if self.verack_received.is_set():
             self.logger.error('duplicate verack message received')
-        else:
-            if payload:
-                self.logger.error('verack message has payload')
-            self.verack_received.set()
+        if payload:
+            self.logger.error('verack message has payload')
+        self.verack_received.set()
 
     async def send_message(self, command, payload):
         '''Send a command and its payload.  Since the message header requires a length and a

@@ -1,5 +1,7 @@
 import os
 import random
+import asyncio
+from asyncio import Queue, create_task, sleep
 from io import BytesIO
 from ipaddress import IPv4Address, IPv6Address
 
@@ -149,10 +151,10 @@ class TestNetAddress:
         assert len({NetAddress('1.2.3.4', 23), NetAddress('1.2.3.4', '23')}) == 1
 
     @pytest.mark.parametrize("host,port,answer",(
-        ('foo.bar', '23', "NetAddress('foo.bar', 23)"),
-        ('foo.bar', 23, "NetAddress('foo.bar', 23)"),
-        ('::1', 15, "NetAddress(IPv6Address('::1'), 15)"),
-        ('5.6.7.8', '23', "NetAddress(IPv4Address('5.6.7.8'), 23)"),
+        ('foo.bar', '23', "NetAddress('foo.bar:23')"),
+        ('foo.bar', 23, "NetAddress('foo.bar:23')"),
+        ('::1', 15, "NetAddress('[::1]:15')"),
+        ('5.6.7.8', '23', "NetAddress('5.6.7.8:23')"),
     ))
     def test_repr(self, host, port, answer):
         assert repr(NetAddress(host, port)) == answer
@@ -511,7 +513,7 @@ class TestMessageHeader:
         dribble = Dribble(answer)
         header = await MessageHeader.from_stream(dribble.stream())
         assert header.magic == magic
-        assert header.command == command
+        assert header.command_bytes == command
         assert header.payload_len == len(payload)
         assert header.checksum == double_sha256(payload)[:4]
         assert header.is_extended is False
@@ -522,7 +524,7 @@ class TestMessageHeader:
         dribble = Dribble(answer)
         header = await MessageHeader.from_stream(dribble.stream())
         assert header.magic == magic
-        assert header.command == command
+        assert header.command_bytes == command
         assert header.payload_len == payload_len
         assert header.checksum == bytes(4)
         assert header.is_extended is True
@@ -551,33 +553,69 @@ class TestMessageHeader:
 
 class FakeNode:
 
-    def __init__(self, is_outgoing, net_address):
+    def __init__(self, is_outgoing, net_address, headers):
         self.is_outgoing = is_outgoing
         self.net_address = net_address
+        self.headers = headers
         self.peer = None
+        # Incoming message queue
         self.queue = Queue()
+        self.residual = b''
 
-    def connect_to(self, node, headers):
+    def connect_to(self, node):
         self.peer = node
-        return Connection(headers, self.send, self.recv, node.net_address, {})
+        return Connection(self.headers, self.send, self.stream(), self.net_address,
+                          self.is_outgoing)
+
+    def stream(self):
+        return Stream(self.recv)
+
+    async def recv(self, size):
+        result = self.residual
+        if not result:
+            result = await self.queue.get()
+        if len(result) <= size:
+            self.residual = b''
+            return result
+        self.residual = result[size:]
+        return result[:size]
 
     async def send(self, raw):
-        put = self.peer.queue
-        for part in Dribble.parts(self, raw):
+        put = self.peer.queue.put
+        for part in Dribble.parts(raw):
             await put(part)
 
 
-def make_headers(network):
-    headers = Headers(network)
+class TestProtocol:
 
+    # Tests: normal handshake both incoming and outgoing
+    # Tests: receive verack before version, both incoming and outgoing
+    # Tests: receive anything else before version or verack, both incoming and outgoing
 
-# class TestProtocol:
+    @pytest.mark.asyncio
+    async def test_handshake(self):
+        headers = Headers(Bitcoin)
+        node_a = FakeNode(True, NetAddress('1.2.3.4', 8333), headers)
+        node_b = FakeNode(False, NetAddress('4.3.2.1', 8334), headers)
 
-#     # Tests: normal handshake both incoming and outgoing
-#     # Tests: receive verack before version, both incoming and outgoing
-#     # Tests: receive anything else before version or verack, both incoming and outgoing
+        conn_a = node_a.connect_to(node_b)
+        conn_b = node_b.connect_to(node_a)
 
-#     def test_handshake(self):
-#         headers = Headers(Bitcoin)
-#         node_a = FakeNode(True, NetAddress('1.2.3.4', 8333))
-#         node_b = FakeNode(True, NetAddress('4.3.2.1', 8334))
+        try:
+            rmloops = [create_task(conn.recv_messages_loop()) for conn in (conn_a, conn_b)]
+            handshakes = [create_task(conn._perform_handshake()) for conn in (conn_a, conn_b)]
+
+            for task in handshakes:
+                await task
+
+            for conn in (conn_a, conn_b):
+                assert conn.version_received.is_set()
+                assert conn.verack_received.is_set()
+        finally:
+            for task in handshakes + rmloops:
+                if not task.done():
+                    task.cancel()
+                    try:
+                        await task
+                    except:
+                        pass
