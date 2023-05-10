@@ -389,6 +389,49 @@ class TestBitcoinService:
         assert repr(service) == "BitcoinService('1.2.3.4:5', <Service.NODE_NETWORK: 1>)"
 
 
+
+X_address = NetAddress.from_string('1.2.3.4:5678')
+X_protoconf = Protoconf(2_000_000, [b'Default', b'BlockPriority'])
+X_service_details = ServiceDetails.from_parts(
+    services=BitcoinService.Service.NODE_NETWORK,
+    address = X_address,
+    protocol_version=80_000,
+    user_agent='/foobar:1.0/',
+    relay=False,
+    timestamp=500_000,
+    assoc_id=b'Default',
+    protoconf=X_protoconf,
+    start_height=5,
+)
+
+
+class TestServiceDetails:
+
+    def test_details_set(self):
+        details = X_service_details
+        assert details.service.address == X_address
+        assert details.service.services == BitcoinService.Service.NODE_NETWORK
+        assert details.protocol_version == 80_000
+        assert details.user_agent == '/foobar:1.0/'
+        assert details.relay is False
+        assert details.timestamp == 500_000
+        assert details.assoc_id == b'Default'
+        assert details.protoconf == X_protoconf
+        assert details.start_height == 5
+
+    def test_details_default(self):
+        details = ServiceDetails.from_parts()
+        assert details.service.address == NetAddress('::', 0, check_port=False)
+        assert details.service.services == BitcoinService.Service.NODE_NONE
+        assert details.protocol_version == 70015
+        assert details.user_agent == '/bitcoinx:0.01/'
+        assert details.relay is True
+        assert details.timestamp is None
+        assert details.assoc_id == b''
+        assert details.protoconf == Protoconf.default()
+        assert details.start_height == 0
+
+
 protoconf_tests = [
     (2_000_000, [b'foo', b'bar'], '0280841e0007666f6f2c626172'),
 ]
@@ -557,6 +600,15 @@ class TestMessageHeader:
                 assert key.lower().encode() == value.rstrip(b'\0')
 
 
+net_addresses = ['1.2.3.4', '4.3.2.1', '001:0db8:85a3:0000:0000:8a2e:0370:7334',
+                 '2001:db8:85a3:8d3:1319:8a2e:370:7348']
+
+def random_net_address():
+    port = random.randrange(1024, 50000)
+    address = random.choice(net_addresses)
+    return NetAddress(address, port)
+
+
 class FakeNode(Peer):
 
     def __init__(self, is_outgoing, their_address, headers, **kwargs):
@@ -587,6 +639,51 @@ class FakeNode(Peer):
         for part in Dribble.parts(raw):
             await put(part)
 
+    async def close_connection(self):
+        await self.remote_peer.queue.put(b'')
+
+    @classmethod
+    def random(cls, is_outgoing, headers=None, **kwargs):
+        headers = headers or Headers(Bitcoin)
+        return cls(is_outgoing, random_net_address(), headers, **kwargs)
+
+
+def setup_connection(out_peer=None, in_peer=None):
+    out_peer = out_peer or FakeNode.random(True)
+    in_peer = in_peer or FakeNode.random(False)
+    out_peer.connect_to(in_peer)
+    in_peer.connect_to(out_peer)
+    return (out_peer, in_peer)
+
+
+async def run_connection(peers, post_handshake=None):
+
+    try:
+        rm_loops = [create_task(peer.protocol.recv_messages_loop()) for peer in peers]
+        handshakes = [create_task(peer.protocol._perform_handshake()) for peer in peers]
+
+        for handshake in handshakes:
+            try:
+                await asyncio.wait_for(handshake, timeout=0.01)
+            except asyncio.TimeoutError:
+                pass
+
+        # Let protoconf be processed (not sure if needed)
+        await sleep(0.001)
+
+        if post_handshake:
+            await post_handshake()
+            await sleep(0.01)
+
+        # Raise any exception from the message loops
+        for rm_loop in rm_loops:
+            if rm_loop.done():
+                rm_loop.result()
+    finally:
+       for task in handshakes + rm_loops:
+            if not task.done():
+                task.cancel()
+
 
 class TestProtocol:
 
@@ -595,131 +692,152 @@ class TestProtocol:
 
     @pytest.mark.asyncio
     async def test_handshake(self):
-        headers = Headers(Bitcoin)
-        addr_a = NetAddress('4.3.2.1', 8334)
-        addr_b = NetAddress('1.2.3.4', 8333)
+        in_peer = FakeNode.random(False)
+        out_peer = FakeNode.random(True, headers=mainnet_headers, our_service=X_service_details)
+        peers = setup_connection(out_peer, in_peer)
 
-        protoconf_b = Protoconf(2_000_000, [b'Default', b'BlockPriority'])
-        service_b = ServiceDetails.from_parts(
-            services=BitcoinService.Service.NODE_NETWORK,
-            protocol_version=80_000,
-            user_agent='/foobar:1.0/',
-            relay=False,
-            timestamp=500_000,
-            assoc_id=b'Default',
-            protoconf=protoconf_b,
-        )
+        await run_connection(peers)
 
-        node_a = FakeNode(True, addr_b, mainnet_headers)
-        node_b = FakeNode(False, addr_a, headers, our_service=service_b)
+        assert all(not peer.connection.disconnected for peer in peers)
 
-        # Check details set correctly
-        assert node_a.our_service.service.services == BitcoinService.Service.NODE_NONE
-        assert node_a.our_service.user_agent == '/bitcoinx:0.01/'
-        assert node_a.our_service.protocol_version == 70_015
-        assert node_a.our_service.start_height == 2099
-        assert node_a.our_service.relay is True
-        assert node_a.our_service.timestamp is None
-        assert node_a.our_service.assoc_id == b''
-        assert node_a.our_service.protoconf == Protoconf.default()
+        # Check all relevant details were correctly recorded in each node
+        for check, other in ((in_peer, out_peer), (out_peer, in_peer)):
+            assert check.version_received.is_set()
+            assert check.verack_received.is_set()
+            assert check.their_service is not None
 
-        assert node_b.our_service.service.services == BitcoinService.Service.NODE_NETWORK
-        assert node_b.our_service.user_agent == '/foobar:1.0/'
-        assert node_b.our_service.protocol_version == 80_000
-        assert node_b.our_service.start_height == 0
-        assert node_b.our_service.relay is False
-        assert node_b.our_service.timestamp == 500_000
-        assert node_b.our_service.assoc_id == b'Default'
-        assert node_b.our_service.protoconf == protoconf_b
-
-        node_a.connect_to(node_b)
-        node_b.connect_to(node_a)
-        nodes = (node_a, node_b)
-
-        try:
-            rmloops = [create_task(node.protocol.recv_messages_loop()) for node in nodes]
-            handshakes = [create_task(node.protocol._perform_handshake()) for node in nodes]
-
-            for task in handshakes:
-                await task
-
-            # Let protoconf be processed
-            await sleep(0.005)
-
-            assert not node_a.connection.disconnected
-            assert not node_b.connection.disconnected
-
-            assert node_a.their_service.service.address == addr_b
-            assert node_b.their_service.service.address == addr_a
-
-            # Check all relevant details were correctly recorded in each node
-            for check, other in ((node_a, node_b), (node_b, node_a)):
-                assert check.version_received.is_set()
-                assert check.verack_received.is_set()
-                assert check.their_service is not None
-
-                assert check.their_service.service.services == other.our_service.service.services
-                assert check.their_service.protocol_version == other.our_service.protocol_version
-                assert check.their_service.user_agent == other.our_service.user_agent
-                assert check.their_service.start_height == other.our_service.start_height
-                if other.our_service.timestamp is None:
-                    assert abs(check.their_service.timestamp - time.time()) < 1
-                else:
-                    assert check.their_service.timestamp == other.our_service.timestamp
-                assert check.their_service.relay == other.our_service.relay
-                assert check.their_service.assoc_id == other.our_service.assoc_id
-                assert check.their_service.protoconf == other.our_service.protoconf
-
-        finally:
-            for task in handshakes + rmloops:
-                if not task.done():
-                    task.cancel()
-            await sleep(0.01)
+            assert check.their_service.service.address == check.connection.their_address
+            assert check.their_service.service.services == other.our_service.service.services
+            assert check.their_service.protocol_version == other.our_service.protocol_version
+            assert check.their_service.user_agent == other.our_service.user_agent
+            assert check.their_service.start_height == other.our_service.start_height
+            if other.our_service.timestamp is None:
+                assert abs(check.their_service.timestamp - time.time()) < 1
+            else:
+                assert check.their_service.timestamp == other.our_service.timestamp
+            assert check.their_service.relay == other.our_service.relay
+            assert check.their_service.assoc_id == other.our_service.assoc_id
+            assert check.their_service.protoconf == other.our_service.protoconf
 
     @pytest.mark.asyncio
     async def test_self_connect(self):
-        headers = Headers(Bitcoin)
-        node = FakeNode(True, NetAddress.from_string('1.2.3.4:556'), headers)
-        node.connect_to(node)
-
-        rmloop = create_task(node.protocol.recv_messages_loop())
-        handshake = create_task(node.protocol._perform_handshake())
-        try:
-            await sleep(0.01)
-            assert rmloop.done()
-
-            with pytest.raises(ForceDisconnectError) as e:
-                rmloop.result()
-            assert 'connected to ourself' in str(e.value)
-            assert node.connection.disconnected
-        finally:
-            for task in (rmloop, handshake):
-                if not task.done():
-                    task.cancel()
-            await sleep(0.01)
+        peer = FakeNode.random(True)
+        peer.connect_to(peer)
+        with pytest.raises(ForceDisconnectError) as e:
+            await run_connection([peer])
+        assert 'connected to ourself' in str(e.value)
+        assert peer.connection.disconnected
 
     @pytest.mark.asyncio
     async def test_bad_magic(self):
-        node_a = FakeNode(True, NetAddress.from_string('1.2.3.4:5555'), Headers(Bitcoin))
-        node_b = FakeNode(False, NetAddress.from_string('1.2.3.4:7777'), Headers(BitcoinTestnet))
+        out_peer=FakeNode.random(True, headers=Headers(BitcoinTestnet))
+        peers = setup_connection(out_peer)
+        with pytest.raises(ForceDisconnectError) as e:
+            await run_connection(peers)
+        assert 'bad magic' in str(e.value)
+        assert any(peer.connection.disconnected for peer in peers)
 
-        node_a.connect_to(node_b)
-        nodes = (node_a, node_b)
+    @pytest.mark.asyncio
+    async def test_bad_checksum(self):
+        async def hijack_message(header):
+            header.checksum = bytes(4)
+            await old_handler(header)
 
-        try:
-            rmloop = create_task(node_b.protocol.recv_messages_loop())
-            handshake = create_task(node_a.protocol._perform_handshake())
+        peers = setup_connection()
+        out_peer, in_peer = peers
+        old_handler = out_peer.protocol._handle_message
+        out_peer.protocol._handle_message = hijack_message
 
-            await sleep(0.01)
-            assert rmloop.done()
+        with pytest.raises(ForceDisconnectError) as e:
+            await run_connection(peers)
+        assert 'bad checksum for version command' in str(e.value)
+        assert any(peer.connection.disconnected for peer in peers)
 
-            with pytest.raises(ForceDisconnectError) as e:
-                rmloop.result()
-            assert 'bad magic' in str(e.value)
-            assert node_b.connection.disconnected
+    @pytest.mark.asyncio
+    async def test_unknown_command(self, caplog):
+        async def send_unknown_message():
+            await peers[0].protocol._send_message(b'foobar', b'')
 
-        finally:
-            for task in (rmloop, handshake):
-                if not task.done():
-                    task.cancel()
-            await sleep(0.01)
+        peers = setup_connection()
+        with caplog.at_level('DEBUG'):
+            await run_connection(peers, post_handshake=send_unknown_message)
+
+        assert not any(peer.connection.disconnected for peer in peers)
+        assert 'ignoring unhandled foobar command' in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_duplicate_version(self, caplog):
+        async def send_version_message():
+            payload = peers[0].our_service.version_payload(
+                peers[0].connection.their_address, bytes(8))
+            await peers[0].protocol._send_message(MessageHeader.VERSION, payload)
+
+        peers = setup_connection()
+        with caplog.at_level('ERROR'):
+            await run_connection(peers, post_handshake=send_version_message)
+
+        assert not any(peer.connection.disconnected for peer in peers)
+        assert 'duplicate version message' in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_duplicate_verack(self, caplog):
+        async def send_verack_message():
+            await peers[0].protocol._send_message(MessageHeader.VERACK, b' ')
+
+        peers = setup_connection()
+        with caplog.at_level('ERROR'):
+            await run_connection(peers, post_handshake=send_verack_message)
+
+        assert not any(peer.connection.disconnected for peer in peers)
+        assert 'duplicate verack message' in caplog.text
+        assert 'verack message has payload' in caplog.text
+
+
+    @pytest.mark.parametrize("peer_index", (0, 1))
+    @pytest.mark.asyncio
+    async def test_verack_before_version(self, peer_index, caplog):
+        peers = setup_connection()
+        await peers[peer_index].protocol._send_message(MessageHeader.VERACK, b'')
+
+        with caplog.at_level('ERROR'):
+            await run_connection(peers)
+
+        assert not any(peer.connection.disconnected for peer in peers)
+        assert 'verack message received before version message sent' in caplog.text
+
+    @pytest.mark.parametrize("peer_index", (0, 1))
+    @pytest.mark.asyncio
+    async def test_protoconf_before_verack(self, peer_index, caplog):
+        async def bad_on_version(*args):
+            await on_version(*args)
+            await peer.protocol._send_message(MessageHeader.PROTOCONF, b'')
+
+        peers = setup_connection()
+        peer = peers[peer_index]
+        on_version = peer.on_version
+        peer.on_version = bad_on_version
+
+        with caplog.at_level('ERROR'):
+            await run_connection(peers)
+
+        assert not any(peer.connection.disconnected for peer in peers)
+        assert 'protoconf command received before handshake finished' in caplog.text
+
+    @pytest.mark.parametrize("peer_index", (0, 1))
+    @pytest.mark.asyncio
+    async def test_premature_connection_closed(self, peer_index, caplog):
+        async def bad_on_version(*args):
+            await on_version(*args)
+            await peer.close_connection()
+
+        peers = setup_connection()
+        peer = peers[peer_index]
+        on_version = peer.on_version
+        peer.on_version = bad_on_version
+
+        with caplog.at_level('INFO'):
+            with pytest.raises(ConnectionClosedError) as e:
+                await run_connection(peers)
+
+        assert not any(peer.connection.disconnected for peer in peers)
+        assert 'connection closed remotely' in caplog.text

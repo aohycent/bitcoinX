@@ -510,11 +510,10 @@ class ServiceDetails:
     protoconf = attr.ib()
     assoc_id = attr.ib()
 
-    def version_payload(self, service, nonce):
+    def version_payload(self, their_service, nonce):
         '''Service is a NetAddress or BitcoinService.'''
-        if isinstance(service, NetAddress):
-            service = BitcoinService(service, 0)
-        assert isinstance(service, BitcoinService)
+        if isinstance(their_service, NetAddress):
+            their_service = BitcoinService(their_service, 0)
         assert isinstance(nonce, (bytes, bytearray)) and len(nonce) == 8
 
         timestamp = int(time.time()) if self.timestamp is None else self.timestamp
@@ -523,8 +522,8 @@ class ServiceDetails:
             pack_le_int32(self.protocol_version),
             pack_le_uint64(self.service.services),
             pack_le_int64(timestamp),
-            service.pack(),
-            self.service.pack(),
+            their_service.pack(),
+            self.service.pack(),   # In practice, ignored by receiver
             nonce,
             pack_varbytes(self.user_agent.encode()),
             pack_le_int32(self.start_height),
@@ -533,12 +532,14 @@ class ServiceDetails:
         ))
 
     @classmethod
-    def from_parts(cls, *, protocol_version=70015, services=BitcoinService.Service.NODE_NONE,
-                   user_agent='/bitcoinx:0.01/', start_height=0, relay=True, timestamp=None,
+    def from_parts(cls, *, address=None, services=BitcoinService.Service.NODE_NONE,
+                   protocol_version=70015, user_agent='/bitcoinx:0.01/',
+                   start_height=0, relay=True, timestamp=None,
                    protoconf=None, assoc_id=b''):
         protoconf = protoconf or Protoconf.default()
+        address = address or NetAddress('::', 0, check_port=False)
         return cls(
-            BitcoinService(NetAddress('::', 0, check_port=False), services),
+            BitcoinService(address, services),
             user_agent, protocol_version, start_height, relay, timestamp, protoconf, assoc_id
         )
 
@@ -551,7 +552,7 @@ class ServiceDetails:
         our_service = BitcoinService.read(read)
         their_service = BitcoinService.read(read)
         if their_service.services != services:
-            logger.warning(f'{their_service.address}: service mismatch in version payload')
+            logger.warning(f'service mismatch in version payload')
         nonce = read(8)
         user_agent = read_varbytes(read)
         start_height = read_le_int32(read)
@@ -609,34 +610,34 @@ class Peer:
 
     # Call to request various things from the peer
 
-    def get_addr(self):
+    async def get_addr(self):
         '''Call to request network nodes from the peer.'''
 
-    def get_data(self, items):
+    async def get_data(self, items):
         '''Request various items from the peer.'''
 
-    def get_block(self, block_hash):
+    async def get_block(self, block_hash):
         '''Call to request the block with the given hash.'''
 
     # Callbacks when certain messages are received.
 
-    def on_addr(self, services):
+    async def on_addr(self, services):
         '''Called when an addr message is received.'''
 
-    def on_block(self, raw):
+    async def on_block(self, raw):
         '''Called when a block is received.'''
 
-    def on_inv(self, items):
+    async def on_inv(self, items):
         '''Called when an inv message is received advertising availability of various objects.'''
 
-    def on_tx(self, raw):
+    async def on_tx(self, raw):
         '''Called when a tx is received.'''
 
-    def on_protoconf(self, protoconf):
+    async def on_protoconf(self, protoconf):
         '''Called when a protoconf message is received.'''
         self.their_service.protoconf = protoconf
 
-    def on_version(self, their_service, address):
+    async def on_version(self, their_service, address):
         '''Called when a version message is received.'''
         assert not self.their_service
         # Overwrite their service address; the one sent is useless
@@ -660,16 +661,15 @@ class ConnectionLogger(logging.LoggerAdapter):
 
 class Connection:
 
-    def __init__(self, address, recv, send):
-        # The peer's address
-        self.address = address
+    def __init__(self, their_address, recv, send):
+        self.their_address = their_address
         self.recv = recv
         self.send = send
         self.disconnected = False
 
         # Logging
         logger = logging.getLogger('C')
-        context = {'conn_id': f'{address}'}
+        context = {'conn_id': f'{their_address}'}
         self.logger = ConnectionLogger(logger, context)
 
     async def recv_exact(self, size):
@@ -677,6 +677,7 @@ class Connection:
         parts = []
         while size > 0:
             part = await recv(size)
+            print('Got:', part)
             if not part:
                 raise ConnectionClosedError(f'connection closed with {size:,d} bytes left')
             parts.append(part)
@@ -755,13 +756,15 @@ class Protocol:
             return
 
         if not header.is_extended and header.payload_checksum(payload) != header.checksum:
-            raise ProtocolError(f'bad payload chceksum for {header} command')
+            # Maybe force disconnect if we get too many bad checksums in a short time
+            error = ProcotolError if self.peer.verack_received.is_set() else ForceDisconnectError
+            raise error(f'bad checksum for {header} command')
+
         await handler(payload)
 
     async def _perform_handshake(self):
         '''Perform the initial handshake.  Send version and verack messages, and wait until a
         verack is received back.'''
-
         our_service = self.peer.our_service
         if not self.peer.is_outgoing:
             # Incoming connections wait for version message first
@@ -769,7 +772,7 @@ class Protocol:
 
         # Send version message
         self._log_service_details(our_service, 'sending version message:')
-        payload = our_service.version_payload(self.connection.address, self.nonce)
+        payload = our_service.version_payload(self.connection.their_address, self.nonce)
         await self._send_message(MessageHeader.VERSION, payload)
 
         self.peer.version_sent = True
@@ -781,7 +784,7 @@ class Protocol:
         await self._send_message(MessageHeader.VERACK, b'')
 
         # Send protoconf
-        await self._send_message(MessageHeader.PROTOCONF,our_service.protoconf.payload())
+        await self._send_message(MessageHeader.PROTOCONF, our_service.protoconf.payload())
 
         # Handhsake is complete once verack is received
         await self.peer.verack_received.wait()
@@ -798,6 +801,7 @@ class Protocol:
         the payload from the stream, and validating the checksum if necessary.
         '''
         while True:
+            header = 'incoming'
             try:
                 header = await MessageHeader.from_stream(self.connection)
                 if header.magic != self.network_magic:
@@ -808,6 +812,9 @@ class Protocol:
                     self.logger.debug(f'<- {header} payload {header.payload_len:,d} bytes')
 
                 await self._handle_message(header)
+            except ConnectionClosedError as e:
+                logging.info(f'connection closed remotely')
+                raise
             except ForceDisconnectError as e:
                 logging.error(f'fatal protocol error, disconnecting: {e}')
                 await self.connection.disconnect()
@@ -815,7 +822,7 @@ class Protocol:
             except ProtocolError as e:
                 logging.error(f'protocol error: {e}')
             except Exception:
-                logging.exception('error handling {header} command')
+                logging.exception(f'error handling {header} message')
 
     async def send_messages_loop(self):
         '''Handles sending the queue of messages.  This sends all messages except the initial
@@ -838,26 +845,26 @@ class Protocol:
 
     async def on_version(self, payload):
         if self.peer.version_received.is_set():
-            raise ProtocolError('duplicate version message received')
+            raise ProtocolError('duplicate version message')
         self.peer.version_received.set()
         read = BytesIO(payload).read
         their_service, _our_service, nonce = ServiceDetails.read(read, self.logger)
         if nonce == self.nonce:
             raise ForceDisconnectError('connected to ourself')
         self._log_service_details(their_service, 'received version message:')
-        self.peer.on_version(their_service, self.connection.address)
+        await self.peer.on_version(their_service, self.connection.their_address)
 
     async def on_verack(self, payload):
         if not self.peer.version_sent:
             raise ProtocolError('verack message received before version message sent')
         if self.peer.verack_received.is_set():
-            self.logger.error('duplicate verack message received')
+            self.logger.error('duplicate verack message')
         if payload:
             self.logger.error('verack message has payload')
         self.peer.verack_received.set()
 
     async def on_protoconf(self, payload):
-        self.peer.on_protoconf(Protoconf.read(BytesIO(payload).read, self.logger))
+        await self.peer.on_protoconf(Protoconf.read(BytesIO(payload).read, self.logger))
 
     async def send_message(self, command, payload):
         '''Send a command and its payload.  Since the message header requires a length and a
