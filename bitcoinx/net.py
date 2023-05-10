@@ -26,7 +26,7 @@ from .packing import (
 
 __all__ = (
     'is_valid_hostname', 'classify_host', 'validate_port', 'validate_protocol',
-    'NetAddress', 'Service', 'ServicePart', 'BitcoinService', 'Protoconf',
+    'NetAddress', 'Service', 'ServicePart', 'BitcoinService', 'ServiceDetails', 'Protoconf',
     'MessageHeader', 'Connection', 'Peer', 'Protocol',
 )
 
@@ -474,6 +474,10 @@ class Protoconf:
         ))
 
     @classmethod
+    def default(cls):
+        return cls(5_000_000, [b'Default'])
+
+    @classmethod
     def read(cls, read, logger=None):
         logger = logger or logging
 
@@ -498,13 +502,13 @@ class ServiceDetails:
     service = attr.ib()
     # A string
     user_agent = attr.ib()
-    version = attr.ib()
+    protocol_version = attr.ib()
     start_height = attr.ib()
     relay = attr.ib()
     # If None the current time is used in to_payload()
-    timestamp = attr.ib(default=None)
-    protoconf = attr.ib(default=None)
-    assoc_id = attr.ib(default=b'')
+    timestamp = attr.ib()
+    protoconf = attr.ib()
+    assoc_id = attr.ib()
 
     def version_payload(self, service, nonce=urandom(8)):
         '''Service is a NetAddress or BitcoinService.'''
@@ -516,7 +520,7 @@ class ServiceDetails:
         timestamp = int(time.time()) if self.timestamp is None else self.timestamp
 
         return b''.join((
-            pack_le_int32(self.version),
+            pack_le_int32(self.protocol_version),
             pack_le_uint64(self.service.services),
             pack_le_int64(timestamp),
             service.pack(),
@@ -527,6 +531,16 @@ class ServiceDetails:
             pack_byte(self.relay),
             pack_varbytes(self.assoc_id),
         ))
+
+    @classmethod
+    def from_parts(cls, *, protocol_version=70015, services=BitcoinService.Service.NODE_NONE,
+                   user_agent='/bitcoinx:0.01/', start_height=0, relay=True, timestamp=None,
+                   protoconf=None, assoc_id=b''):
+        protoconf = protoconf or Protoconf.default()
+        return cls(
+            BitcoinService(NetAddress('::', 0, check_port=False), services),
+            user_agent, protocol_version, start_height, relay, timestamp, protoconf, assoc_id
+        )
 
     @classmethod
     def read(cls, read, logger):
@@ -560,7 +574,7 @@ class ServiceDetails:
 
     def __str__(self):
         return (
-            f'{self.service} {self.user_agent!r} version={self.version} '
+            f'{self.service} {self.user_agent!r} version={self.protocol_version} '
             f'start_height={self.start_height:,d} relay={self.relay} timestamp={self.timestamp} '
             f'assoc_id={self.assoc_id!r}'
         )
@@ -574,12 +588,7 @@ class Peer:
     level.
     '''
 
-    def __init__(self, headers, is_outgoing, *,
-                 protocol_version=70015, service_flags=BitcoinService.Service.NODE_NONE,
-                 user_agent='/bitcoinx:0.01/', relay=True,
-                 timestamp=None, protoconf=Protoconf(2_000_000, [b'Default']),
-                 assoc_id=b'', verbosity=2,
-    ):
+    def __init__(self, headers, is_outgoing, *, our_service=None, verbosity=2):
         self.headers = headers
         self.is_outgoing = is_outgoing
         # Verbosity: 0 (warnings), 1 (info), 2 (debug)
@@ -590,12 +599,8 @@ class Peer:
         self.streams = {}
         # Instances of ServiceDetails
         self.their_service = None
-        self.our_service = ServiceDetails(
-            service=BitcoinService(NetAddress('::', 0, check_port=False), service_flags),
-            version=protocol_version,
-            user_agent=user_agent, start_height=headers.height,
-            relay=relay, timestamp=timestamp, protoconf=protoconf, assoc_id=assoc_id
-        )
+        self.our_service = our_service or ServiceDetails.from_parts()
+        self.our_service.start_height = headers.height
 
         # State
         self.version_sent = False
@@ -631,9 +636,11 @@ class Peer:
         '''Called when a protoconf message is received.'''
         self.their_service.protoconf = protoconf
 
-    def on_version(self, their_service):
+    def on_version(self, their_service, address):
         '''Called when a version message is received.'''
         assert not self.their_service
+        # Overwrite their service address; the one sent is useless
+        their_service.service.address = address
         self.their_service = their_service
 
 
@@ -711,7 +718,7 @@ class Protocol:
         self.logger.info(headline)
         self.logger.info(f'    user_agent={serv.user_agent} '
                          f'services={serv.service.services!r}')
-        self.logger.info(f'    protocol={serv.version} height={serv.start_height:,d}  '
+        self.logger.info(f'    protocol={serv.protocol_version} height={serv.start_height:,d}  '
                          f'relay={serv.relay} timestamp={serv.timestamp} assoc_id={serv.assoc_id}')
 
     async def _send_message(self, command, payload):
@@ -824,10 +831,8 @@ class Protocol:
         self.peer.version_received.set()
         read = BytesIO(payload).read
         their_service, _our_service, _nonce = ServiceDetails.read(read, self.logger)
-        # Overwrite their service address
-        their_service.service.address = self.connection.address
         self._log_service_details(their_service, 'received version message:')
-        self.peer.on_version(their_service)
+        self.peer.on_version(their_service, self.connection.address)
 
     async def on_verack(self, payload):
         if not self.peer.version_sent:

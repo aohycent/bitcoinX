@@ -601,28 +601,38 @@ class TestProtocol:
         addr_a = NetAddress('4.3.2.1', 8334)
         addr_b = NetAddress('1.2.3.4', 8333)
 
+        protoconf_b = Protoconf(2_000_000, [b'Default', b'BlockPriority'])
+        service_b = ServiceDetails.from_parts(
+            services=BitcoinService.Service.NODE_NETWORK,
+            protocol_version=80_000,
+            user_agent='/foobar:1.0/',
+            relay=False,
+            timestamp=500_000,
+            assoc_id=b'Default',
+            protoconf=protoconf_b,
+        )
+
         node_a = FakeNode(True, addr_b, mainnet_headers)
-        node_b = FakeNode(False, addr_a, headers,
-                          service_flags=BitcoinService.Service.NODE_NETWORK,
-                          protocol_version=80_000, user_agent='/foobar:1.0/', relay=False,
-                          timestamp=500_000, assoc_id=b'Default')
+        node_b = FakeNode(False, addr_a, headers, our_service=service_b)
 
         # Check details set correctly
         assert node_a.our_service.service.services == BitcoinService.Service.NODE_NONE
         assert node_a.our_service.user_agent == '/bitcoinx:0.01/'
-        assert node_a.our_service.version == 70_015
+        assert node_a.our_service.protocol_version == 70_015
         assert node_a.our_service.start_height == 2099
         assert node_a.our_service.relay is True
         assert node_a.our_service.timestamp is None
         assert node_a.our_service.assoc_id == b''
+        assert node_a.our_service.protoconf == Protoconf.default()
 
         assert node_b.our_service.service.services == BitcoinService.Service.NODE_NETWORK
         assert node_b.our_service.user_agent == '/foobar:1.0/'
-        assert node_b.our_service.version == 80_000
+        assert node_b.our_service.protocol_version == 80_000
         assert node_b.our_service.start_height == 0
         assert node_b.our_service.relay is False
         assert node_b.our_service.timestamp == 500_000
         assert node_b.our_service.assoc_id == b'Default'
+        assert node_b.our_service.protoconf == protoconf_b
 
         node_a.connect_to(node_b)
         node_b.connect_to(node_a)
@@ -635,7 +645,9 @@ class TestProtocol:
             for task in handshakes:
                 await task
 
-            # FIXME: Check protoconf
+            # Let protoconf be processed
+            await sleep(0.005)
+
             assert node_a.their_service.service.address == addr_b
             assert node_b.their_service.service.address == addr_a
 
@@ -646,7 +658,7 @@ class TestProtocol:
                 assert check.their_service is not None
 
                 assert check.their_service.service.services == other.our_service.service.services
-                assert check.their_service.version == other.our_service.version
+                assert check.their_service.protocol_version == other.our_service.protocol_version
                 assert check.their_service.user_agent == other.our_service.user_agent
                 assert check.their_service.start_height == other.our_service.start_height
                 if other.our_service.timestamp is None:
@@ -655,8 +667,7 @@ class TestProtocol:
                     assert check.their_service.timestamp == other.our_service.timestamp
                 assert check.their_service.relay == other.our_service.relay
                 assert check.their_service.assoc_id == other.our_service.assoc_id
-                # assert check.their_service.protoconf == other.our_service.protoconf
-                print(check.their_service.protoconf)
+                assert check.their_service.protoconf == other.our_service.protoconf
 
         finally:
             for task in handshakes + rmloops:
