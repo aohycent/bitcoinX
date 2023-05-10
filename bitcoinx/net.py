@@ -15,7 +15,7 @@ from ipaddress import ip_address, IPv4Address, IPv6Address
 from os import urandom
 from struct import Struct, error as struct_error
 
-from .errors import ConnectionClosedError, ProtocolError
+from .errors import ConnectionClosedError, ProtocolError, ForceDisconnectError
 from .hashes import double_sha256
 from .packing import (
     pack_byte, pack_le_int32, pack_le_uint32, pack_le_int64, pack_le_uint64, pack_varint,
@@ -510,7 +510,7 @@ class ServiceDetails:
     protoconf = attr.ib()
     assoc_id = attr.ib()
 
-    def version_payload(self, service, nonce=urandom(8)):
+    def version_payload(self, service, nonce):
         '''Service is a NetAddress or BitcoinService.'''
         if isinstance(service, NetAddress):
             service = BitcoinService(service, 0)
@@ -665,6 +665,7 @@ class Connection:
         self.address = address
         self.recv = recv
         self.send = send
+        self.disconnected = False
 
         # Logging
         logger = logging.getLogger('C')
@@ -681,6 +682,9 @@ class Connection:
             parts.append(part)
             size -= len(part)
         return b''.join(parts)
+
+    async def disconnect(self):
+        self.disconnected = True
 
     # async def chunks(self, chunk_size, total_size):
     #     '''Asynchronous generator of chunks.  Caller must send the number of bytes consumed.'''
@@ -712,6 +716,7 @@ class Protocol:
         self.verbosity = self.peer.verbosity
 
         # Outgoing messages
+        self.nonce = urandom(8)
         self.outgoing_messages = Queue()
 
     def _log_service_details(self, serv, headline):
@@ -764,7 +769,7 @@ class Protocol:
 
         # Send version message
         self._log_service_details(our_service, 'sending version message:')
-        payload = our_service.version_payload(self.connection.address)
+        payload = our_service.version_payload(self.connection.address, self.nonce)
         await self._send_message(MessageHeader.VERSION, payload)
 
         self.peer.version_sent = True
@@ -803,6 +808,12 @@ class Protocol:
 
             try:
                 await self._handle_message(header)
+            except ForceDisconnectError as e:
+                logging.error(f'fatal protocol error, disconnecting: {e}')
+                await self.connection.disconnect()
+                raise
+            except ProtocolError as e:
+                logging.error(f'protocol error: {e}')
             except Exception:
                 logging.exception('error handling {header} command')
 
@@ -830,7 +841,9 @@ class Protocol:
             raise ProtocolError('duplicate version message received')
         self.peer.version_received.set()
         read = BytesIO(payload).read
-        their_service, _our_service, _nonce = ServiceDetails.read(read, self.logger)
+        their_service, _our_service, nonce = ServiceDetails.read(read, self.logger)
+        if nonce == self.nonce:
+            raise ForceDisconnectError('connected to ourself')
         self._log_service_details(their_service, 'received version message:')
         self.peer.on_version(their_service, self.connection.address)
 

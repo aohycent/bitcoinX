@@ -10,7 +10,7 @@ import pytest
 
 from bitcoinx import Bitcoin, double_sha256, Headers, pack_varint
 from bitcoinx.net import *
-from bitcoinx.errors import ConnectionClosedError, ProtocolError
+from bitcoinx.errors import ConnectionClosedError, ProtocolError, ForceDisconnectError
 
 from .test_work import mainnet_first_2100
 
@@ -590,10 +590,8 @@ class FakeNode(Peer):
 
 class TestProtocol:
 
-    # Tests: normal handshake both incoming and outgoing
     # Tests: receive verack before version, both incoming and outgoing
     # Tests: receive anything else before version or verack, both incoming and outgoing
-    # Test: do not connect to self
 
     @pytest.mark.asyncio
     async def test_handshake(self):
@@ -648,6 +646,9 @@ class TestProtocol:
             # Let protoconf be processed
             await sleep(0.005)
 
+            assert not node_a.connection.disconnected
+            assert not node_b.connection.disconnected
+
             assert node_a.their_service.service.address == addr_b
             assert node_b.their_service.service.address == addr_a
 
@@ -671,6 +672,28 @@ class TestProtocol:
 
         finally:
             for task in handshakes + rmloops:
+                if not task.done():
+                    task.cancel()
+            await sleep(0.01)
+
+    @pytest.mark.asyncio
+    async def test_self_connect(self):
+        headers = Headers(Bitcoin)
+        node = FakeNode(True, NetAddress.from_string('1.2.3.4:556'), headers)
+        node.connect_to(node)
+
+        rmloop = create_task(node.protocol.recv_messages_loop())
+        handshake = create_task(node.protocol._perform_handshake())
+        try:
+            await sleep(0.01)
+            assert rmloop.done()
+
+            with pytest.raises(ForceDisconnectError) as e:
+                rmloop.result()
+            assert 'connected to ourself' in str(e.value)
+            assert node.connection.disconnected
+        finally:
+            for task in (rmloop, handshake):
                 if not task.done():
                     task.cancel()
             await sleep(0.01)
