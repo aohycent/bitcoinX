@@ -8,7 +8,7 @@ from ipaddress import IPv4Address, IPv6Address
 
 import pytest
 
-from bitcoinx import Bitcoin, double_sha256, Headers, pack_varint
+from bitcoinx import Bitcoin, BitcoinTestnet, double_sha256, Headers, pack_varint
 from bitcoinx.net import *
 from bitcoinx.errors import ConnectionClosedError, ProtocolError, ForceDisconnectError
 
@@ -692,6 +692,32 @@ class TestProtocol:
                 rmloop.result()
             assert 'connected to ourself' in str(e.value)
             assert node.connection.disconnected
+        finally:
+            for task in (rmloop, handshake):
+                if not task.done():
+                    task.cancel()
+            await sleep(0.01)
+
+    @pytest.mark.asyncio
+    async def test_bad_magic(self):
+        node_a = FakeNode(True, NetAddress.from_string('1.2.3.4:5555'), Headers(Bitcoin))
+        node_b = FakeNode(False, NetAddress.from_string('1.2.3.4:7777'), Headers(BitcoinTestnet))
+
+        node_a.connect_to(node_b)
+        nodes = (node_a, node_b)
+
+        try:
+            rmloop = create_task(node_b.protocol.recv_messages_loop())
+            handshake = create_task(node_a.protocol._perform_handshake())
+
+            await sleep(0.01)
+            assert rmloop.done()
+
+            with pytest.raises(ForceDisconnectError) as e:
+                rmloop.result()
+            assert 'bad magic' in str(e.value)
+            assert node_b.connection.disconnected
+
         finally:
             for task in (rmloop, handshake):
                 if not task.done():

@@ -798,15 +798,15 @@ class Protocol:
         the payload from the stream, and validating the checksum if necessary.
         '''
         while True:
-            header = await MessageHeader.from_stream(self.connection)
-            if header.magic != self.network_magic:
-                raise ProtocolError(f'bad magic: got 0x{header.magic.hex()} '
-                                    f'expected 0x{self.network_magic.hex()}')
-
-            if self.verbosity >= 2:
-                self.logger.debug(f'<- {header} payload {header.payload_len:,d} bytes')
-
             try:
+                header = await MessageHeader.from_stream(self.connection)
+                if header.magic != self.network_magic:
+                    raise ForceDisconnectError(f'bad magic: got 0x{header.magic.hex()} '
+                                               f'expected 0x{self.network_magic.hex()}')
+
+                if self.verbosity >= 2:
+                    self.logger.debug(f'<- {header} payload {header.payload_len:,d} bytes')
+
                 await self._handle_message(header)
             except ForceDisconnectError as e:
                 logging.error(f'fatal protocol error, disconnecting: {e}')
