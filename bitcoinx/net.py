@@ -505,10 +505,10 @@ class ServiceDetails:
     relay = attr.ib(default=False)
     # If None the current time is used in to_payload()
     timestamp = attr.ib(default=None)
-    assoc_id = attr.ib(default=b'')
     protoconf = attr.ib(default=None)
+    assoc_id = attr.ib(default=b'')
 
-    def version_payload(self, service, nonce):
+    def version_payload(self, service, nonce=urandom(8)):
         '''Service is a NetAddress or BitcoinService.'''
         if isinstance(service, NetAddress):
             service = BitcoinService(service, 0)
@@ -581,24 +581,22 @@ class Peer:
     '''
 
     def __init__(self, headers, is_outgoing, *,
-                 max_payload_size=2_000_000,
+                 protoconf=Protoconf(2_000_000, [b'Default']),
                  verbosity=2,
     ):
         self.headers = headers
-        self.network = headers.network
         self.is_outgoing = is_outgoing
-        self.max_payload_size = max_payload_size
         # Verbosity: 0 (warnings), 1 (info), 2 (debug)
         self.verbosity = verbosity
+
+        self.network = headers.network
         # There can be several streams (connections) in an association.
         self.streams = {}
         # Instances of ServiceDetails
         self.their_service = None
         self.our_service = ServiceDetails(
             service=BitcoinService(NetAddress('::', 0, check_port=False), 0),
-            user_agent='/Artemovsk:0.01/',
-            protoconf=Protoconf(max_payload_size, [b'Default']),
-            start_height=headers.height,
+            user_agent='/Artemovsk:0.01/', protoconf=protoconf, start_height=headers.height,
         )
 
         # State
@@ -713,6 +711,14 @@ class Protocol:
         self.logger.info(f'    protocol={serv.version} height={serv.start_height:,d}  '
                          f'relay={serv.relay} timestamp={serv.timestamp} assoc_id={serv.assoc_id}')
 
+    async def _send_message(self, command, payload):
+        header = MessageHeader.std_bytes(self.network_magic, command, payload)
+        if len(payload) + len(header) <= 536:
+            await self.connection.send(header + payload)
+        else:
+            await self.connection.send(header)
+            await self.connection.send(payload)
+
     async def _handle_message(self, header):
         if not self.peer.verack_received.is_set():
             if header.command_bytes not in (MessageHeader.VERSION, MessageHeader.VERACK):
@@ -741,29 +747,28 @@ class Protocol:
         '''Perform the initial handshake.  Send version and verack messages, and wait until a
         verack is received back.'''
 
-        async def send_version():
-            '''Send a version message.'''
-            our_service = self.peer.our_service
-            self._log_service_details(our_service, 'sending version message:')
+        our_service = self.peer.our_service
+        if not self.peer.is_outgoing:
+            # Incoming connections wait for version message first
+            await self.peer.version_received.wait()
 
-            payload = our_service.version_payload(self.connection.address, urandom(8))
-            header = MessageHeader.std_bytes(self.network_magic, MessageHeader.VERSION, payload)
-            await self.connection.send(header)
-            await self.connection.send(payload)
-            self.peer.version_sent = True
+        # Send version message
+        self._log_service_details(our_service, 'sending version message:')
+        payload = our_service.version_payload(self.connection.address)
+        await self._send_message(MessageHeader.VERSION, payload)
 
-        async def send_verack():
-            header = MessageHeader.std_bytes(self.network_magic, MessageHeader.VERACK, b'')
-            await self.connection.send(header)
-
+        self.peer.version_sent = True
         if self.peer.is_outgoing:
-            await send_version()
+            # Outoing connections wait now
             await self.peer.version_received.wait()
-        else:
-            # Incoming connections wait until the version message is received.
-            await self.peer.version_received.wait()
-            await send_version()
-        await send_verack()
+
+        # Send verack
+        await self._send_message(MessageHeader.VERACK, b'')
+
+        # Send protoconf
+        await self._send_message(MessageHeader.PROTOCONF,our_service.protoconf.payload())
+
+        # Handhsake is complete once verack is received
         await self.peer.verack_received.wait()
 
     #
