@@ -18,6 +18,13 @@ from bitcoinx.work import *
 data_dir = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'data')
 
 
+def mainnet_first_2100():
+    headers = Headers(Bitcoin)
+    with open(os.path.join(data_dir, 'mainnet-headers-2100'), 'rb') as f:
+        headers.connect_many(f.read())
+    return headers
+
+
 @pytest.mark.parametrize("bits,answer", (
     (0x00000000, 0x0),
     (0x03123456, 0x123456),

@@ -277,8 +277,6 @@ ext_extra_struct = Struct('<12sQ')
 ext_extra_unpack = ext_extra_struct.unpack
 empty_checksum = bytes(4)
 
-PROTOCOL_VERSION = 70015
-
 
 class InventoryKind(IntEnum):
     ERROR = 0
@@ -389,7 +387,7 @@ class BitcoinService:
     '''
     struct = Struct('<Q16s2s')
 
-    class Flags(IntFlag):
+    class Service(IntFlag):
         NODE_NONE = 0
         NODE_NETWORK = 1 << 0
         # All other flags are obsolete
@@ -400,7 +398,7 @@ class BitcoinService:
         if not isinstance(address.host, (IPv4Address, IPv6Address)):
             raise ValueError('BitcoinService requires an IP address')
         self.address = address
-        self.services = self.Flags(services)
+        self.services = self.Service(services)
 
     def __eq__(self, other):
         return (isinstance(other, BitcoinService) and
@@ -500,9 +498,9 @@ class ServiceDetails:
     service = attr.ib()
     # A string
     user_agent = attr.ib()
-    version = attr.ib(default=PROTOCOL_VERSION)
-    start_height = attr.ib(default=0)
-    relay = attr.ib(default=False)
+    version = attr.ib()
+    start_height = attr.ib()
+    relay = attr.ib()
     # If None the current time is used in to_payload()
     timestamp = attr.ib(default=None)
     protoconf = attr.ib(default=None)
@@ -516,6 +514,7 @@ class ServiceDetails:
         assert isinstance(nonce, (bytes, bytearray)) and len(nonce) == 8
 
         timestamp = int(time.time()) if self.timestamp is None else self.timestamp
+
         return b''.join((
             pack_le_int32(self.version),
             pack_le_uint64(self.service.services),
@@ -526,8 +525,7 @@ class ServiceDetails:
             pack_varbytes(self.user_agent.encode()),
             pack_le_int32(self.start_height),
             pack_byte(self.relay),
-            # FIXME: uncomment this once we can handle the implications
-            # pack_varbytes(self.assoc_id),
+            pack_varbytes(self.assoc_id),
         ))
 
     @classmethod
@@ -545,24 +543,20 @@ class ServiceDetails:
         start_height = read_le_int32(read)
         # Relay is optional, defaulting to True
         relay = read(1) != b'\0'
-        # Association ID is optional.  We set it to None if not provided.
+        # Association ID is optional.  We set it to the empty byte string if not provided.
         try:
             assoc_id = read_varbytes(read)
         except struct_error:
-            assoc_id = None
+            assoc_id = b''
 
         try:
             user_agent = user_agent.decode()
         except UnicodeDecodeError:
             user_agent = '0x' + user_agent.hex()
 
-        details = cls(their_service, user_agent, version, start_height, relay, timestamp, assoc_id)
+        details = cls(their_service, user_agent, version, start_height, relay, timestamp, None,
+                      assoc_id)
         return details, our_service, nonce
-
-    def read_protoconf(self, read, logger):
-        if self.protoconf:
-            raise ProtocolError('received second protoconf message')
-        self.protoconf = Protoconf.read(read, logger)
 
     def __str__(self):
         return (
@@ -581,8 +575,10 @@ class Peer:
     '''
 
     def __init__(self, headers, is_outgoing, *,
-                 protoconf=Protoconf(2_000_000, [b'Default']),
-                 verbosity=2,
+                 protocol_version=70015, service_flags=BitcoinService.Service.NODE_NONE,
+                 user_agent='/bitcoinx:0.01/', relay=True,
+                 timestamp=None, protoconf=Protoconf(2_000_000, [b'Default']),
+                 assoc_id=b'', verbosity=2,
     ):
         self.headers = headers
         self.is_outgoing = is_outgoing
@@ -595,8 +591,10 @@ class Peer:
         # Instances of ServiceDetails
         self.their_service = None
         self.our_service = ServiceDetails(
-            service=BitcoinService(NetAddress('::', 0, check_port=False), 0),
-            user_agent='/Artemovsk:0.01/', protoconf=protoconf, start_height=headers.height,
+            service=BitcoinService(NetAddress('::', 0, check_port=False), service_flags),
+            version=protocol_version,
+            user_agent=user_agent, start_height=headers.height,
+            relay=relay, timestamp=timestamp, protoconf=protoconf, assoc_id=assoc_id
         )
 
         # State
@@ -629,6 +627,10 @@ class Peer:
     def on_tx(self, raw):
         '''Called when a tx is received.'''
 
+    def on_protoconf(self, protoconf):
+        '''Called when a protoconf message is received.'''
+        self.their_service.protoconf = protoconf
+
     def on_version(self, their_service):
         '''Called when a version message is received.'''
         assert not self.their_service
@@ -652,6 +654,7 @@ class ConnectionLogger(logging.LoggerAdapter):
 class Connection:
 
     def __init__(self, address, recv, send):
+        # The peer's address
         self.address = address
         self.recv = recv
         self.send = send
@@ -821,6 +824,8 @@ class Protocol:
         self.peer.version_received.set()
         read = BytesIO(payload).read
         their_service, _our_service, _nonce = ServiceDetails.read(read, self.logger)
+        # Overwrite their service address
+        their_service.service.address = self.connection.address
         self._log_service_details(their_service, 'received version message:')
         self.peer.on_version(their_service)
 
@@ -832,6 +837,9 @@ class Protocol:
         if payload:
             self.logger.error('verack message has payload')
         self.peer.verack_received.set()
+
+    async def on_protoconf(self, payload):
+        self.peer.on_protoconf(Protoconf.read(BytesIO(payload).read, self.logger))
 
     async def send_message(self, command, payload):
         '''Send a command and its payload.  Since the message header requires a length and a

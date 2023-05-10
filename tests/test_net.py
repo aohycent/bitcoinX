@@ -1,6 +1,7 @@
+import asyncio
 import os
 import random
-import asyncio
+import time
 from asyncio import Queue, create_task, sleep
 from io import BytesIO
 from ipaddress import IPv4Address, IPv6Address
@@ -10,6 +11,11 @@ import pytest
 from bitcoinx import Bitcoin, double_sha256, Headers, pack_varint
 from bitcoinx.net import *
 from bitcoinx.errors import ConnectionClosedError, ProtocolError
+
+from .test_work import mainnet_first_2100
+
+
+mainnet_headers = mainnet_first_2100()
 
 
 ##
@@ -308,16 +314,16 @@ class TestService:
 
 
 pack_tests = (
-    ('[1a00:23c6:cf86:6201:3cc8:85d1:c41f:9bf6]:8333', BitcoinService.Flags.NODE_NONE,
+    ('[1a00:23c6:cf86:6201:3cc8:85d1:c41f:9bf6]:8333', BitcoinService.Service.NODE_NONE,
      bytes(8) + b'\x1a\x00#\xc6\xcf\x86b\x01<\xc8\x85\xd1\xc4\x1f\x9b\xf6 \x8d'),
-    ('1.2.3.4:56', BitcoinService.Flags.NODE_NETWORK,
+    ('1.2.3.4:56', BitcoinService.Service.NODE_NETWORK,
      b'\1' + bytes(17) + b'\xff\xff\1\2\3\4\0\x38'),
 )
 
 pack_ts_tests = (
-    ('[1a00:23c6:cf86:6201:3cc8:85d1:c41f:9bf6]:8333', BitcoinService.Flags.NODE_NETWORK,
+    ('[1a00:23c6:cf86:6201:3cc8:85d1:c41f:9bf6]:8333', BitcoinService.Service.NODE_NETWORK,
      123456789,'15cd5b0701000000000000001a0023c6cf8662013cc885d1c41f9bf6208d'),
-    ('100.101.102.103:104', BitcoinService.Flags.NODE_NONE, 987654321,
+    ('100.101.102.103:104', BitcoinService.Service.NODE_NONE, 987654321,
      'b168de3a000000000000000000000000000000000000ffff646566670068'),
 )
 
@@ -326,21 +332,21 @@ class TestBitcoinService:
 
     def test_constructor_bad(self):
         with pytest.raises(ValueError):
-            BitcoinService('foo.bar:2', BitcoinService.Flags.NODE_NONE)
+            BitcoinService('foo.bar:2', BitcoinService.Service.NODE_NONE)
 
     def test_eq(self):
-        assert BitcoinService(NetAddress('1.2.3.4', 35), BitcoinService.Flags.NODE_NETWORK) == \
-            BitcoinService('1.2.3.4:35', BitcoinService.Flags.NODE_NETWORK)
-        assert BitcoinService('1.2.3.4:35', BitcoinService.Flags.NODE_NETWORK) != \
-            BitcoinService('1.2.3.4:36', BitcoinService.Flags.NODE_NETWORK)
-        assert BitcoinService(NetAddress('1.2.3.4', 35), BitcoinService.Flags.NODE_NETWORK) != \
-            BitcoinService(NetAddress('1.2.3.5', 35), BitcoinService.Flags.NODE_NETWORK)
-        assert BitcoinService('1.2.3.4:35', BitcoinService.Flags.NODE_NETWORK) != \
-            BitcoinService('1.2.3.5:35', BitcoinService.Flags.NODE_NONE)
+        assert BitcoinService(NetAddress('1.2.3.4', 35), BitcoinService.Service.NODE_NETWORK) == \
+            BitcoinService('1.2.3.4:35', BitcoinService.Service.NODE_NETWORK)
+        assert BitcoinService('1.2.3.4:35', BitcoinService.Service.NODE_NETWORK) != \
+            BitcoinService('1.2.3.4:36', BitcoinService.Service.NODE_NETWORK)
+        assert BitcoinService(NetAddress('1.2.3.4', 35), BitcoinService.Service.NODE_NETWORK) != \
+            BitcoinService(NetAddress('1.2.3.5', 35), BitcoinService.Service.NODE_NETWORK)
+        assert BitcoinService('1.2.3.4:35', BitcoinService.Service.NODE_NETWORK) != \
+            BitcoinService('1.2.3.5:35', BitcoinService.Service.NODE_NONE)
 
     def test_hashable(self):
-        assert 1 == len({BitcoinService('1.2.3.5:35', BitcoinService.Flags.NODE_NONE),
-                         BitcoinService('1.2.3.5:35', BitcoinService.Flags.NODE_NONE)})
+        assert 1 == len({BitcoinService('1.2.3.5:35', BitcoinService.Service.NODE_NONE),
+                         BitcoinService('1.2.3.5:35', BitcoinService.Service.NODE_NONE)})
 
     @pytest.mark.parametrize('address,services,result', pack_tests)
     def test_pack(self, address, services, result):
@@ -379,8 +385,8 @@ class TestBitcoinService:
 
     def test_str_repr(self):
         service = BitcoinService('1.2.3.4:5', 1)
-        assert str(service) == '1.2.3.4:5 <Flags.NODE_NETWORK: 1>'
-        assert repr(service) == "BitcoinService('1.2.3.4:5', <Flags.NODE_NETWORK: 1>)"
+        assert str(service) == '1.2.3.4:5 <Service.NODE_NETWORK: 1>'
+        assert repr(service) == "BitcoinService('1.2.3.4:5', <Service.NODE_NETWORK: 1>)"
 
 
 protoconf_tests = [
@@ -553,16 +559,14 @@ class TestMessageHeader:
 
 class FakeNode(Peer):
 
-    def __init__(self, is_outgoing, net_address, headers):
-        super().__init__(headers, is_outgoing)
-        self.net_address = net_address
+    def __init__(self, is_outgoing, their_address, headers, **kwargs):
+        super().__init__(headers, is_outgoing, **kwargs)
         self.remote_peer = None
         # Incoming message queue
         self.queue = Queue()
         self.residual = b''
 
-        #
-        self.connection = Connection(net_address, self.recv, self.send)
+        self.connection = Connection(their_address, self.recv, self.send)
         self.protocol = Protocol(self, self.connection)
 
     def connect_to(self, peer):
@@ -589,12 +593,37 @@ class TestProtocol:
     # Tests: normal handshake both incoming and outgoing
     # Tests: receive verack before version, both incoming and outgoing
     # Tests: receive anything else before version or verack, both incoming and outgoing
+    # Test: do not connect to self
 
     @pytest.mark.asyncio
     async def test_handshake(self):
         headers = Headers(Bitcoin)
-        node_a = FakeNode(True, NetAddress('1.2.3.4', 8333), headers)
-        node_b = FakeNode(False, NetAddress('4.3.2.1', 8334), headers)
+        addr_a = NetAddress('4.3.2.1', 8334)
+        addr_b = NetAddress('1.2.3.4', 8333)
+
+        node_a = FakeNode(True, addr_b, mainnet_headers)
+        node_b = FakeNode(False, addr_a, headers,
+                          service_flags=BitcoinService.Service.NODE_NETWORK,
+                          protocol_version=80_000, user_agent='/foobar:1.0/', relay=False,
+                          timestamp=500_000, assoc_id=b'Default')
+
+        # Check details set correctly
+        assert node_a.our_service.service.services == BitcoinService.Service.NODE_NONE
+        assert node_a.our_service.user_agent == '/bitcoinx:0.01/'
+        assert node_a.our_service.version == 70_015
+        assert node_a.our_service.start_height == 2099
+        assert node_a.our_service.relay is True
+        assert node_a.our_service.timestamp is None
+        assert node_a.our_service.assoc_id == b''
+
+        assert node_b.our_service.service.services == BitcoinService.Service.NODE_NETWORK
+        assert node_b.our_service.user_agent == '/foobar:1.0/'
+        assert node_b.our_service.version == 80_000
+        assert node_b.our_service.start_height == 0
+        assert node_b.our_service.relay is False
+        assert node_b.our_service.timestamp == 500_000
+        assert node_b.our_service.assoc_id == b'Default'
+
         node_a.connect_to(node_b)
         node_b.connect_to(node_a)
         nodes = (node_a, node_b)
@@ -606,9 +635,29 @@ class TestProtocol:
             for task in handshakes:
                 await task
 
-            for node in nodes:
-                assert node.version_received.is_set()
-                assert node.verack_received.is_set()
+            # FIXME: Check protoconf
+            assert node_a.their_service.service.address == addr_b
+            assert node_b.their_service.service.address == addr_a
+
+            # Check all relevant details were correctly recorded in each node
+            for check, other in ((node_a, node_b), (node_b, node_a)):
+                assert check.version_received.is_set()
+                assert check.verack_received.is_set()
+                assert check.their_service is not None
+
+                assert check.their_service.service.services == other.our_service.service.services
+                assert check.their_service.version == other.our_service.version
+                assert check.their_service.user_agent == other.our_service.user_agent
+                assert check.their_service.start_height == other.our_service.start_height
+                if other.our_service.timestamp is None:
+                    assert abs(check.their_service.timestamp - time.time()) < 1
+                else:
+                    assert check.their_service.timestamp == other.our_service.timestamp
+                assert check.their_service.relay == other.our_service.relay
+                assert check.their_service.assoc_id == other.our_service.assoc_id
+                # assert check.their_service.protoconf == other.our_service.protoconf
+                print(check.their_service.protoconf)
+
         finally:
             for task in handshakes + rmloops:
                 if not task.done():
