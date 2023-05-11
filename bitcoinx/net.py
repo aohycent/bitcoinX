@@ -597,8 +597,21 @@ class Protoconf:
         return Protoconf(max_payload, stream_policies.split(b','))
 
 
+class Node:
+    '''Represents the state of a network, e.g., mainnet.'''
+
+    def __init__(self, network):
+        self.headers = Headers(network)
+        # List of peers.  Each peer has a unique assoc_id, and can have several
+        # connections open.
+        self.peers = []
+
+    async def connect(self, net_address):
+        pass
+
+
 class Peer:
-    '''Handles a single peer.  Can involve several connections in a single association, even
+    '''Represents a single logical peer association.  There can be multiple connections even
     to different network addresses.
 
     Logic here is high-level - details of the network protocol are handled at the Protocol
@@ -620,6 +633,11 @@ class Peer:
         self.version_sent = False
         self.version_received = Event()
         self.verack_received = Event()
+
+    # async def sync_headers(self):
+    #     '''Call to synchronize remote chain with our headers.'''
+    #     #self.logger.debug(f'requesting headers; locator has {len(locator)} entries')
+    #     #await self.send_message(NetMessage.GETHEADERS, pack_block_locator(locator))
 
     # Call to request various things from the peer
 
