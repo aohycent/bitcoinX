@@ -10,6 +10,7 @@ import pytest
 
 from bitcoinx import Bitcoin, BitcoinTestnet, double_sha256, Headers, pack_varint
 from bitcoinx.net import *
+from bitcoinx.net import ServicePacking
 from bitcoinx.errors import ConnectionClosedError, ProtocolError, ForceDisconnectError
 
 from .test_work import mainnet_first_2100
@@ -314,86 +315,23 @@ class TestService:
 
 
 pack_tests = (
-    ('[1a00:23c6:cf86:6201:3cc8:85d1:c41f:9bf6]:8333', BitcoinService.Service.NODE_NONE,
+    ('[1a00:23c6:cf86:6201:3cc8:85d1:c41f:9bf6]:8333', ServiceFlags.NODE_NONE,
      bytes(8) + b'\x1a\x00#\xc6\xcf\x86b\x01<\xc8\x85\xd1\xc4\x1f\x9b\xf6 \x8d'),
-    ('1.2.3.4:56', BitcoinService.Service.NODE_NETWORK,
+    ('1.2.3.4:56', ServiceFlags.NODE_NETWORK,
      b'\1' + bytes(17) + b'\xff\xff\1\2\3\4\0\x38'),
 )
 
 pack_ts_tests = (
-    ('[1a00:23c6:cf86:6201:3cc8:85d1:c41f:9bf6]:8333', BitcoinService.Service.NODE_NETWORK,
+    ('[1a00:23c6:cf86:6201:3cc8:85d1:c41f:9bf6]:8333', ServiceFlags.NODE_NETWORK,
      123456789,'15cd5b0701000000000000001a0023c6cf8662013cc885d1c41f9bf6208d'),
-    ('100.101.102.103:104', BitcoinService.Service.NODE_NONE, 987654321,
+    ('100.101.102.103:104', ServiceFlags.NODE_NONE, 987654321,
      'b168de3a000000000000000000000000000000000000ffff646566670068'),
 )
 
-
-class TestBitcoinService:
-
-    def test_constructor_bad(self):
-        with pytest.raises(ValueError):
-            BitcoinService('foo.bar:2', BitcoinService.Service.NODE_NONE)
-
-    def test_eq(self):
-        assert BitcoinService(NetAddress('1.2.3.4', 35), BitcoinService.Service.NODE_NETWORK) == \
-            BitcoinService('1.2.3.4:35', BitcoinService.Service.NODE_NETWORK)
-        assert BitcoinService('1.2.3.4:35', BitcoinService.Service.NODE_NETWORK) != \
-            BitcoinService('1.2.3.4:36', BitcoinService.Service.NODE_NETWORK)
-        assert BitcoinService(NetAddress('1.2.3.4', 35), BitcoinService.Service.NODE_NETWORK) != \
-            BitcoinService(NetAddress('1.2.3.5', 35), BitcoinService.Service.NODE_NETWORK)
-        assert BitcoinService('1.2.3.4:35', BitcoinService.Service.NODE_NETWORK) != \
-            BitcoinService('1.2.3.5:35', BitcoinService.Service.NODE_NONE)
-
-    def test_hashable(self):
-        assert 1 == len({BitcoinService('1.2.3.5:35', BitcoinService.Service.NODE_NONE),
-                         BitcoinService('1.2.3.5:35', BitcoinService.Service.NODE_NONE)})
-
-    @pytest.mark.parametrize('address,services,result', pack_tests)
-    def test_pack(self, address, services, result):
-        assert BitcoinService(address, services).pack() == result
-
-    @pytest.mark.parametrize('address,services,ts,result', pack_ts_tests)
-    def test_pack_with_timestamp(self, address, services, ts, result):
-        assert BitcoinService(address, services).pack_with_timestamp(ts) == bytes.fromhex(result)
-
-    @pytest.mark.parametrize('address,services,result', pack_tests)
-    def test_unpack(self, address, services, result):
-        assert BitcoinService.unpack(result) == BitcoinService(address, services)
-
-    @pytest.mark.parametrize('address,services,result', pack_tests)
-    def test_read(self, address, services, result):
-        assert BitcoinService.read(BytesIO(result).read) == BitcoinService(address, services)
-
-    @pytest.mark.parametrize('address,services,ts,result', pack_ts_tests)
-    def test_read_with_timestamp(self, address, services, ts, result):
-        read = BytesIO(bytes.fromhex(result)).read
-        service, timestamp = BitcoinService.read_with_timestamp(read)
-        assert ts == timestamp
-        assert service == BitcoinService(address, services)
-
-    def test_read_addrs(self):
-        raw = bytearray()
-        raw += pack_varint(len(pack_ts_tests))
-        for address, flags, ts, packed in pack_ts_tests:
-            raw += bytes.fromhex(packed)
-        result = BitcoinService.read_addrs(BytesIO(raw).read)
-        assert len(result) == len(pack_ts_tests)
-        for n, (service, ts) in enumerate(result):
-            address, flags, timestamp, packed = pack_ts_tests[n]
-            assert ts == timestamp
-            assert service == BitcoinService(address, flags)
-
-    def test_str_repr(self):
-        service = BitcoinService('1.2.3.4:5', 1)
-        assert str(service) == '1.2.3.4:5 <Service.NODE_NETWORK: 1>'
-        assert repr(service) == "BitcoinService('1.2.3.4:5', <Service.NODE_NETWORK: 1>)"
-
-
-
 X_address = NetAddress.from_string('1.2.3.4:5678')
 X_protoconf = Protoconf(2_000_000, [b'Default', b'BlockPriority'])
-X_service_details = ServiceDetails.from_parts(
-    services=BitcoinService.Service.NODE_NETWORK,
+X_service = BitcoinService(
+    services=ServiceFlags.NODE_NETWORK,
     address = X_address,
     protocol_version=80_000,
     user_agent='/foobar:1.0/',
@@ -405,31 +343,89 @@ X_service_details = ServiceDetails.from_parts(
 )
 
 
-class TestServiceDetails:
+class TestServicePacking:
 
-    def test_details_set(self):
-        details = X_service_details
-        assert details.service.address == X_address
-        assert details.service.services == BitcoinService.Service.NODE_NETWORK
-        assert details.protocol_version == 80_000
-        assert details.user_agent == '/foobar:1.0/'
-        assert details.relay is False
-        assert details.timestamp == 500_000
-        assert details.assoc_id == b'Default'
-        assert details.protoconf == X_protoconf
-        assert details.start_height == 5
+    @pytest.mark.parametrize('address,services,result', pack_tests)
+    def test_pack(self, address, services, result):
+        assert ServicePacking.pack(NetAddress.from_string(address), services) == result
 
-    def test_details_default(self):
-        details = ServiceDetails.from_parts()
-        assert details.service.address == NetAddress('::', 0, check_port=False)
-        assert details.service.services == BitcoinService.Service.NODE_NONE
-        assert details.protocol_version == 70015
-        assert details.user_agent == '/bitcoinx:0.01/'
-        assert details.relay is True
-        assert details.timestamp is None
-        assert details.assoc_id == b''
-        assert details.protoconf == Protoconf.default()
-        assert details.start_height == 0
+    @pytest.mark.parametrize('address,services,ts,result', pack_ts_tests)
+    def test_pack_with_timestamp(self, address, services, ts, result):
+        addr = NetAddress.from_string(address)
+        assert ServicePacking.pack_with_timestamp(addr, services, ts) == bytes.fromhex(result)
+
+    @pytest.mark.parametrize('address,services,result', pack_tests)
+    def test_unpack(self, address, services, result):
+        assert ServicePacking.unpack(result) == (NetAddress.from_string(address), services)
+
+    @pytest.mark.parametrize('address,services,result', pack_tests)
+    def test_read(self, address, services, result):
+        assert ServicePacking.read(BytesIO(result).read) == (
+            NetAddress.from_string(address), services)
+
+    @pytest.mark.parametrize('address,services,ts,result', pack_ts_tests)
+    def test_read_with_timestamp(self, address, services, ts, result):
+        read = BytesIO(bytes.fromhex(result)).read
+        addr, srvcs, timestamp = ServicePacking.read_with_timestamp(read)
+        assert ts == timestamp
+        assert services == srvcs
+        assert addr == NetAddress.from_string(address)
+
+    def test_read_addrs(self):
+        raw = bytearray()
+        raw += pack_varint(len(pack_ts_tests))
+        for address, flags, ts, packed in pack_ts_tests:
+            raw += bytes.fromhex(packed)
+        result = ServicePacking.read_addrs(BytesIO(raw).read)
+        assert len(result) == len(pack_ts_tests)
+        for n, (addr, srvcs, ts) in enumerate(result):
+            address, services, timestamp, packed = pack_ts_tests[n]
+            assert addr == NetAddress.from_string(address)
+            assert srvcs == services
+            assert ts == timestamp
+
+
+class TestBitcoinService:
+
+    def test_eq(self):
+        assert BitcoinService(address=NetAddress('1.2.3.4', 35),
+                              services=ServiceFlags.NODE_NETWORK) == \
+            BitcoinService(address='1.2.3.4:35', services=ServiceFlags.NODE_NETWORK)
+        assert BitcoinService(address='1.2.3.4:35', services=ServiceFlags.NODE_NETWORK) != \
+            BitcoinService(address='1.2.3.4:36', services=ServiceFlags.NODE_NETWORK)
+        assert X_service == BitcoinService(address=X_address)
+
+    def test_hashable(self):
+        assert 1 == len({BitcoinService(address='1.2.3.5:35', services=ServiceFlags.NODE_NONE),
+                         BitcoinService(address='1.2.3.5:35', services=ServiceFlags.NODE_NETWORK)})
+
+    def test_str_repr(self):
+        service = BitcoinService(address='1.2.3.4:5', services=1)
+        assert repr(service) == str(service)
+
+    def test_service_set(self):
+        service = X_service
+        assert service.address == X_address
+        assert service.services == ServiceFlags.NODE_NETWORK
+        assert service.protocol_version == 80_000
+        assert service.user_agent == '/foobar:1.0/'
+        assert service.relay is False
+        assert service.timestamp == 500_000
+        assert service.assoc_id == b'Default'
+        assert service.protoconf == X_protoconf
+        assert service.start_height == 5
+
+    def test_service_default(self):
+        service = BitcoinService()
+        assert service.address == NetAddress('::', 0, check_port=False)
+        assert service.services == ServiceFlags.NODE_NONE
+        assert service.protocol_version == 0
+        assert service.user_agent is None
+        assert service.relay is True
+        assert service.timestamp is None
+        assert service.assoc_id is None
+        assert service.protoconf == Protoconf.default()
+        assert service.start_height == 0
 
 
 protoconf_tests = [
@@ -687,13 +683,10 @@ async def run_connection(peers, post_handshake=None):
 
 class TestProtocol:
 
-    # Tests: receive verack before version, both incoming and outgoing
-    # Tests: receive anything else before version or verack, both incoming and outgoing
-
     @pytest.mark.asyncio
     async def test_handshake(self):
         in_peer = FakeNode.random(False)
-        out_peer = FakeNode.random(True, headers=mainnet_headers, our_service=X_service_details)
+        out_peer = FakeNode.random(True, headers=mainnet_headers, our_service=X_service)
         peers = setup_connection(out_peer, in_peer)
 
         await run_connection(peers)
@@ -706,10 +699,11 @@ class TestProtocol:
             assert check.verack_received.is_set()
             assert check.their_service is not None
 
-            assert check.their_service.service.address == check.connection.their_address
-            assert check.their_service.service.services == other.our_service.service.services
+            assert check.their_service.address == check.connection.their_address
+            assert check.their_service.services == other.our_service.services
             assert check.their_service.protocol_version == other.our_service.protocol_version
-            assert check.their_service.user_agent == other.our_service.user_agent
+            other_user_agent = other.our_service.user_agent or '/bitcoinx:0.01/'
+            assert check.their_service.user_agent == other_user_agent
             assert check.their_service.start_height == other.our_service.start_height
             if other.our_service.timestamp is None:
                 assert abs(check.their_service.timestamp - time.time()) < 1
@@ -768,7 +762,7 @@ class TestProtocol:
     @pytest.mark.asyncio
     async def test_duplicate_version(self, caplog):
         async def send_version_message():
-            payload = peers[0].our_service.version_payload(
+            payload = peers[0].our_service.to_version_payload(
                 peers[0].connection.their_address, bytes(8))
             await peers[0].protocol._send_message(MessageHeader.VERSION, payload)
 

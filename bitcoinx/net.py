@@ -26,7 +26,7 @@ from .packing import (
 
 __all__ = (
     'is_valid_hostname', 'classify_host', 'validate_port', 'validate_protocol',
-    'NetAddress', 'Service', 'ServicePart', 'BitcoinService', 'ServiceDetails', 'Protoconf',
+    'NetAddress', 'Service', 'ServicePart', 'BitcoinService', 'ServiceFlags', 'Protoconf',
     'MessageHeader', 'Connection', 'Peer', 'Protocol',
 )
 
@@ -292,7 +292,6 @@ class MessageHeader:
     '''The header of a network protocol message.'''
 
     # Extended headers were introduced in the BSV 1.0.10 node software.
-
     COMMAND_LEN = 12
     STD_HEADER_SIZE = std_header_struct.size
     EXT_HEADER_SIZE = ext_header_struct.size
@@ -379,80 +378,183 @@ MessageHeader.VERACK = _command('verack')
 MessageHeader.VERSION = _command('version')
 
 
-class BitcoinService:
-    '''Represents a bitcoin network service.
+class ServiceFlags(IntFlag):
+    NODE_NONE = 0
+    NODE_NETWORK = 1 << 0
+    # All other flags are obsolete
 
-    Consists of an NetAddress (which must have an IPv4 or IPv6 resolved host) and a
-    services mask.
-    '''
+
+class ServicePacking:
     struct = Struct('<Q16s2s')
 
-    class Service(IntFlag):
-        NODE_NONE = 0
-        NODE_NETWORK = 1 << 0
-        # All other flags are obsolete
+    @classmethod
+    def pack(cls, address, services):
+        '''Return the address and service flags as an encoded service.
 
-    def __init__(self, address, services):
-        if not isinstance(address, NetAddress):
-            address = NetAddress.from_string(address)
-        if not isinstance(address.host, (IPv4Address, IPv6Address)):
-            raise ValueError('BitcoinService requires an IP address')
-        self.address = address
-        self.services = self.Service(services)
-
-    def __eq__(self, other):
-        return (isinstance(other, BitcoinService) and
-                self.address == other.address and self.services == other.services)
-
-    def __hash__(self):
-        return hash((self.address, self.services))
-
-    def pack(self):
-        '''Return the service as an encoded internet address as used in the Bitcoin network
-        protocol.  No timestamp is prefixed, as for the version message.
+        No timestamp is prefixed; this is used in for the version message.
         '''
-        return pack_le_uint64(self.services) + self.address.pack()
+        return pack_le_uint64(services) + address.pack()
 
-    def pack_with_timestamp(self, timestamp):
-        '''Return the service as an encoded internet address as used in the Bitcoin network
-        protocol, including a 4-byte timestamp prefix.
-        '''
-        return pack_le_uint32(timestamp) + self.pack()
+    @classmethod
+    def pack_with_timestamp(cls, address, services, timestamp):
+        '''Return an encoded service with a 4-byte timestamp prefix.'''
+        return pack_le_uint32(timestamp) + cls.pack(address, services)
 
     @classmethod
     def unpack(cls, raw):
         '''Given the final 26 bytes (no leading timestamp) of a protocol-encoded
-        internet address return a BitcoinService object.'''
+        internet address return a (NetAddress, services) pair.'''
         services, address, raw_port = cls.struct.unpack(raw)
         address = ip_address(address)
         if address.ipv4_mapped:
             address = address.ipv4_mapped
         port, = unpack_port(raw_port)
-        return cls(NetAddress(address, port, check_port=False), services)
+        return (NetAddress(address, port, check_port=False), ServiceFlags(services))
 
     @classmethod
     def read(cls, read):
-        '''Reads 26 bytes from a raw byte stream.'''
+        '''Reads 26 bytes from a raw byte stream, returns a (NetAddress, services) pair.'''
         return cls.unpack(read(cls.struct.size))
 
     @classmethod
     def read_with_timestamp(cls, read):
         '''Read a timestamp-prefixed net_addr (4 + 26 bytes); return a
-        (BitcoinService, timestamp) pair.'''
+        (NetAddress, services, timestamp) tuple.'''
         timestamp = read_le_uint32(read)
-        return cls.read(read), timestamp
+        address, services = cls.read(read)
+        return (address, services, timestamp)
 
     @classmethod
     def read_addrs(cls, read):
-        '''Return a lits of (service, timestamp) pairs from an addr message payload.'''
+        '''Return a lits of (NetAddress, services, timestamp) triples from an addr
+        message payload.'''
         count = read_varint(read)
-        return [cls.read_with_timestamp(read) for _ in range(count)]
+        read_with_timestamp = cls.read_with_timestamp
+        return [read_with_timestamp(read) for _ in range(count)]
+
+
+class BitcoinService:
+    '''Represents a bitcoin network service.
+
+    Stores various details obtained from the version message.  Comparison and hashing is
+    only done on the (resolved) network address.
+    '''
+
+    def __init__(self, *,
+                 address=None,
+                 services=ServiceFlags.NODE_NONE,
+                 user_agent=None,
+                 protocol_version=0,
+                 start_height=0,
+                 relay=True,
+                 timestamp=None,
+                 protoconf=None,
+                 assoc_id=None):
+        if address is None:
+            address = NetAddress('::', 0, check_port=False)
+        elif not isinstance(address, NetAddress):
+            address = NetAddress.from_string(address)
+        if not isinstance(address.host, (IPv4Address, IPv6Address)):
+            raise ValueError('BitcoinService requires an IP address')
+
+        self.address = address
+        self.services = ServiceFlags(services)
+        self.user_agent = user_agent
+        self.protocol_version = protocol_version
+        self.start_height = start_height
+        self.relay = relay
+        self.timestamp = timestamp
+        self.protoconf = protoconf or Protoconf.default()
+        self.assoc_id = assoc_id
+
+    def __eq__(self, other):
+        return self.address == other.address
+
+    def __hash__(self):
+        return hash(self.address)
+
+    def to_version_payload(self, their_service, nonce):
+        '''Create a version message payload.
+
+        If self.timestamp is None, then the current time is used.
+        their_service is a NetAddress or BitcoinService.
+        '''
+        nonce = bytes(nonce)
+        if len(nonce) != 8:
+            raise ValueError('nonce must be 8 bytes')
+
+        if isinstance(their_service, NetAddress):
+            their_service_packed = ServicePacking.pack(their_service, ServiceFlags.NODE_NONE)
+        else:
+            their_service_packed = their_service.pack()
+
+        timestamp = int(time.time()) if self.timestamp is None else self.timestamp
+        assoc_id = b'' if self.assoc_id is None else pack_varbytes(self.assoc_id)
+        user_agent = '/bitcoinx:0.01/' if self.user_agent is None else self.user_agent
+
+        return b''.join((
+            pack_le_int32(self.protocol_version),
+            pack_le_uint64(self.services),
+            pack_le_int64(timestamp),
+            their_service_packed,
+            self.pack(),   # In practice this is ignored by receiver
+            nonce,
+            pack_varbytes(user_agent.encode()),
+            pack_le_int32(self.start_height),
+            pack_byte(self.relay),
+            assoc_id,
+        ))
+
+    @classmethod
+    def read(cls, read):
+        '''Read a version payload.  Return a tuple (their_service, our_address, our_services,
+        nonce) as described in the payload.
+        '''
+        protocol_version = read_le_uint32(read)
+        services = read_le_uint64(read)
+        timestamp = read_le_int64(read)
+        our_address, our_services = ServicePacking.read(read)
+        their_address, _ = ServicePacking.read(read)   # Ignore redundant services field here
+        nonce = read(8)
+        user_agent = read_varbytes(read)
+        start_height = read_le_int32(read)
+        # Relay is optional, defaulting to True
+        relay = read(1) != b'\0'
+        # Association ID is optional.  We set it to None if not provided.
+        try:
+            assoc_id = read_varbytes(read)
+        except struct_error:
+            assoc_id = None
+
+        try:
+            user_agent = user_agent.decode()
+        except UnicodeDecodeError:
+            user_agent = '0x' + user_agent.hex()
+
+        their_service = cls(address=their_address, services=services, user_agent=user_agent,
+                            protocol_version=protocol_version, start_height=start_height,
+                            relay=relay, timestamp=timestamp, assoc_id=assoc_id)
+        return (their_service, our_address, our_services, nonce)
+
+    def pack(self):
+        '''Return the address and service flags as an encoded service.'''
+        return ServicePacking.pack(self.address, self.services)
+
+    def pack_with_timestamp(self, timestamp):
+        '''Return an encoded service with a 4-byte timestamp prefix.'''
+        return ServicePacking.pack_with_timestamp(self.address, self.services, timestamp)
 
     def __str__(self):
-        return f'{self.address} {self.services!r}'
+        return repr(self)
 
     def __repr__(self):
-        return f"BitcoinService('{self.address}', {self.services!r})"
+        return (
+            f'BitcoinService({self.address}, services={self.services!r}, '
+            f'user_agent={self.user_agent!r}, protocol_version={self.protocol_version}, '
+            f'start_height={self.start_height:,d} relay={self.relay} '
+            f'timestamp={self.timestamp}, protoconf={self.protoconf}, '
+            f'assoc_id={self.assoc_id!r})'
+        )
 
 
 @attr.s(repr=True)
@@ -495,92 +597,6 @@ class Protoconf:
         return Protoconf(max_payload, stream_policies.split(b','))
 
 
-@attr.s(slots=True, repr=True)
-class ServiceDetails:
-    '''Stores the useful non-redundant information of a version message.'''
-    # A BitcoinService object (the sender of a version message)
-    service = attr.ib()
-    # A string
-    user_agent = attr.ib()
-    protocol_version = attr.ib()
-    start_height = attr.ib()
-    relay = attr.ib()
-    # If None the current time is used in to_payload()
-    timestamp = attr.ib()
-    protoconf = attr.ib()
-    assoc_id = attr.ib()
-
-    def version_payload(self, their_service, nonce):
-        '''Service is a NetAddress or BitcoinService.'''
-        if isinstance(their_service, NetAddress):
-            their_service = BitcoinService(their_service, 0)
-        assert isinstance(nonce, (bytes, bytearray)) and len(nonce) == 8
-
-        timestamp = int(time.time()) if self.timestamp is None else self.timestamp
-
-        return b''.join((
-            pack_le_int32(self.protocol_version),
-            pack_le_uint64(self.service.services),
-            pack_le_int64(timestamp),
-            their_service.pack(),
-            self.service.pack(),   # In practice, ignored by receiver
-            nonce,
-            pack_varbytes(self.user_agent.encode()),
-            pack_le_int32(self.start_height),
-            pack_byte(self.relay),
-            pack_varbytes(self.assoc_id),
-        ))
-
-    @classmethod
-    def from_parts(cls, *, address=None, services=BitcoinService.Service.NODE_NONE,
-                   protocol_version=70015, user_agent='/bitcoinx:0.01/',
-                   start_height=0, relay=True, timestamp=None,
-                   protoconf=None, assoc_id=b''):
-        protoconf = protoconf or Protoconf.default()
-        address = address or NetAddress('::', 0, check_port=False)
-        return cls(
-            BitcoinService(address, services),
-            user_agent, protocol_version, start_height, relay, timestamp, protoconf, assoc_id
-        )
-
-    @classmethod
-    def read(cls, read, logger):
-        '''Returns a (version_info, our_service, nonce) tuple.'''
-        version = read_le_uint32(read)
-        services = read_le_uint64(read)
-        timestamp = read_le_int64(read)
-        our_service = BitcoinService.read(read)
-        their_service = BitcoinService.read(read)
-        if their_service.services != services:
-            logger.warning(f'service mismatch in version payload')
-        nonce = read(8)
-        user_agent = read_varbytes(read)
-        start_height = read_le_int32(read)
-        # Relay is optional, defaulting to True
-        relay = read(1) != b'\0'
-        # Association ID is optional.  We set it to the empty byte string if not provided.
-        try:
-            assoc_id = read_varbytes(read)
-        except struct_error:
-            assoc_id = b''
-
-        try:
-            user_agent = user_agent.decode()
-        except UnicodeDecodeError:
-            user_agent = '0x' + user_agent.hex()
-
-        details = cls(their_service, user_agent, version, start_height, relay, timestamp, None,
-                      assoc_id)
-        return details, our_service, nonce
-
-    def __str__(self):
-        return (
-            f'{self.service} {self.user_agent!r} version={self.protocol_version} '
-            f'start_height={self.start_height:,d} relay={self.relay} timestamp={self.timestamp} '
-            f'assoc_id={self.assoc_id!r}'
-        )
-
-
 class Peer:
     '''Handles a single peer.  Can involve several connections in a single association, even
     to different network addresses.
@@ -596,12 +612,9 @@ class Peer:
         self.verbosity = verbosity
 
         self.network = headers.network
-        # There can be several streams (connections) in an association.
-        self.streams = {}
-        # Instances of ServiceDetails
+        # Instances of BitcoinService
+        self.our_service = our_service or BitcoinService(start_height=headers)
         self.their_service = None
-        self.our_service = our_service or ServiceDetails.from_parts()
-        self.our_service.start_height = headers.height
 
         # State
         self.version_sent = False
@@ -635,13 +648,13 @@ class Peer:
 
     async def on_protoconf(self, protoconf):
         '''Called when a protoconf message is received.'''
+        assert self.their_service
         self.their_service.protoconf = protoconf
 
-    async def on_version(self, their_service, address):
-        '''Called when a version message is received.'''
+    async def on_version(self, their_service):
+        '''Called when a version message is received.   Their service is as they report it,
+        except the address is the actual connection address.'''
         assert not self.their_service
-        # Overwrite their service address; the one sent is useless
-        their_service.service.address = address
         self.their_service = their_service
 
 
@@ -722,8 +735,7 @@ class Protocol:
 
     def _log_service_details(self, serv, headline):
         self.logger.info(headline)
-        self.logger.info(f'    user_agent={serv.user_agent} '
-                         f'services={serv.service.services!r}')
+        self.logger.info(f'    user_agent={serv.user_agent} services={serv.services!r}')
         self.logger.info(f'    protocol={serv.protocol_version} height={serv.start_height:,d}  '
                          f'relay={serv.relay} timestamp={serv.timestamp} assoc_id={serv.assoc_id}')
 
@@ -757,7 +769,7 @@ class Protocol:
 
         if not header.is_extended and header.payload_checksum(payload) != header.checksum:
             # Maybe force disconnect if we get too many bad checksums in a short time
-            error = ProcotolError if self.peer.verack_received.is_set() else ForceDisconnectError
+            error = ProtocolError if self.peer.verack_received.is_set() else ForceDisconnectError
             raise error(f'bad checksum for {header} command')
 
         await handler(payload)
@@ -771,8 +783,9 @@ class Protocol:
             await self.peer.version_received.wait()
 
         # Send version message
+        our_service.start_height = self.peer.headers.height
         self._log_service_details(our_service, 'sending version message:')
-        payload = our_service.version_payload(self.connection.their_address, self.nonce)
+        payload = our_service.to_version_payload(self.connection.their_address, self.nonce)
         await self._send_message(MessageHeader.VERSION, payload)
 
         self.peer.version_sent = True
@@ -812,8 +825,8 @@ class Protocol:
                     self.logger.debug(f'<- {header} payload {header.payload_len:,d} bytes')
 
                 await self._handle_message(header)
-            except ConnectionClosedError as e:
-                logging.info(f'connection closed remotely')
+            except ConnectionClosedError:
+                logging.info('connection closed remotely')
                 raise
             except ForceDisconnectError as e:
                 logging.error(f'fatal protocol error, disconnecting: {e}')
@@ -848,11 +861,13 @@ class Protocol:
             raise ProtocolError('duplicate version message')
         self.peer.version_received.set()
         read = BytesIO(payload).read
-        their_service, _our_service, nonce = ServiceDetails.read(read, self.logger)
+        their_service, _our_address, _our_services, nonce = BitcoinService.read(read)
         if nonce == self.nonce:
             raise ForceDisconnectError('connected to ourself')
+        # Overwrite their service address; the one sent is uninteresting
+        their_service.address = self.connection.their_address
         self._log_service_details(their_service, 'received version message:')
-        await self.peer.on_version(their_service, self.connection.their_address)
+        await self.peer.on_version(their_service)
 
     async def on_verack(self, payload):
         if not self.peer.version_sent:
