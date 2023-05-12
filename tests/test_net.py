@@ -2,7 +2,7 @@ import asyncio
 import os
 import random
 import time
-from asyncio import Queue, create_task, sleep
+from asyncio import Queue, create_task, sleep, IncompleteReadError
 from io import BytesIO
 from ipaddress import IPv4Address, IPv6Address
 
@@ -11,7 +11,7 @@ import pytest
 from bitcoinx import Bitcoin, BitcoinTestnet, double_sha256, Headers, pack_varint, _version_str
 from bitcoinx.net import *
 from bitcoinx.net import ServicePacking
-from bitcoinx.errors import ConnectionClosedError, ProtocolError, ForceDisconnectError
+from bitcoinx.errors import ProtocolError, ForceDisconnectError
 
 from .test_work import mainnet_first_2100
 
@@ -492,13 +492,12 @@ class Dribble:
         self.cursor = 0
 
     def stream(self):
-        return Connection(self.recv, None)
+        return Connection(self.readexactly, None)
 
-    async def recv(self, size):
-        old_cursor = self.cursor
-        count = min(random.randrange(0, size) + 1, len(self.raw) - self.cursor)
-        self.cursor += count
-        return self.raw[old_cursor: old_cursor + count]
+    async def readexactly(self, size):
+        result = self.raw[self.cursor: self.cursor + size]
+        self.cursor += size
+        return result
 
     @staticmethod
     def lengths(total):
@@ -611,7 +610,8 @@ class FakePeer(Peer):
         # Incoming message queue
         self.queue = Queue()
         self.residual = b''
-        self.connection = Connection(self.recv, self.send)
+        self.connection = self
+        self.outgoing_messages = Queue()
 
     def connect_to(self, peer):
         peer.is_outgoing = False
@@ -619,15 +619,22 @@ class FakePeer(Peer):
         self.remote_peer = peer
         peer.remote_peer = self
 
-    async def recv(self, size):
-        result = self.residual
-        if not result:
-            result = await self.queue.get()
-        if len(result) <= size:
-            self.residual = b''
-            return result
-        self.residual = result[size:]
-        return result[:size]
+    async def readexactly(self, size):
+        parts = []
+        part = self.residual
+        while True:
+            size -= len(part)
+            parts.append(part)
+            if size <= 0:
+                if size < 0:
+                    self.residual = part[size:]
+                    parts[-1] = part[:size]
+                else:
+                    self.residual = b''
+                return b''.join(parts)
+            part = await self.queue.get()
+            if part is None:
+                raise IncompleteReadError(b'', size)
 
     async def send(self, raw):
         put = self.remote_peer.queue.put
@@ -635,7 +642,7 @@ class FakePeer(Peer):
             await put(part)
 
     async def close_connection(self):
-        await self.remote_peer.queue.put(b'')
+        await self.remote_peer.queue.put(None)
 
     @classmethod
     def random(cls, node, **kwargs):
@@ -673,22 +680,6 @@ async def run_connection(peers, post_handshake=None):
 
 
 class TestConnection:
-
-    @pytest.mark.parametrize("N", (5, 32, 100))
-    @pytest.mark.asyncio
-    async def test_recv_exact(self, N):
-        dribble = Dribble(memoryview(os.urandom(N)))
-        stream = dribble.stream()
-        assert dribble.raw == await stream.recv_exact(N)
-
-        dribble.cursor = 0
-        with pytest.raises(ConnectionClosedError):
-            await stream.recv_exact(N + 1)
-
-        dribble.cursor = 0
-        parts = [await stream.recv_exact(length) for length in Dribble.lengths(N)]
-        assert b''.join(parts) == dribble.raw
-
 
     @pytest.mark.asyncio
     async def test_handshake(self):
@@ -829,18 +820,12 @@ class TestConnection:
     @pytest.mark.parametrize("peer_index", (0, 1))
     @pytest.mark.asyncio
     async def test_premature_connection_closed(self, peer_index, caplog):
-        async def bad_on_version(*args):
-            await on_version(*args)
-            await peer.close_connection()
-
         peers = setup_connection()
         peer = peers[peer_index]
-        on_version = peer.on_version
-        peer.on_version = bad_on_version
 
         with caplog.at_level('INFO'):
-            with pytest.raises(ConnectionClosedError) as e:
-                await run_connection(peers)
+            with pytest.raises(IncompleteReadError) as e:
+                await run_connection(peers, post_handshake=peer.close_connection)
 
         assert not any(peer.disconnected for peer in peers)
         assert 'connection closed remotely' in caplog.text

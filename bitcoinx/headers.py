@@ -262,14 +262,13 @@ class Headers:
 
     def connect(self, raw_header, check_work=True):
         '''Connect a header to the set of headers.  Optionally performs expensive proof-of-work
-        checks if check_work is True.  Returns the chain it lies on.
+        checks if check_work is True.  Returns a (chain, hdr_hash) pair.
         '''
-        hashes = self.hashes
         tips = self.tips
 
         hdr_hash = header_hash(raw_header)
         prev_hash = raw_header[4:36]
-        chain, height = hashes.get(prev_hash, (None, -1))
+        chain, height = self.lookup(prev_hash)
         height += 1
 
         if not chain:
@@ -277,12 +276,12 @@ class Headers:
                 raise MissingHeader(f'previous header {hash_to_hex_str(prev_hash)} not present')
             # Handle duplicate genesis block
             if self.hashes:
-                chain, _ = hashes[hdr_hash]
-                return chain
+                chain, _ = self.hashes[hdr_hash]
+                return chain, hdr_hash
             chain = Chain(None, height)
         elif tips[chain] != prev_hash:
             # Silently ignore duplicate headers
-            duplicate, _ = hashes.get(hdr_hash, (None, -1))
+            duplicate, _ = self.lookup(hdr_hash)
             if duplicate:
                 return duplicate
             # Form a new chain
@@ -299,9 +298,9 @@ class Headers:
                 raise InsufficientPoW(header)
 
         chain.append(raw_header)
-        hashes[hdr_hash] = (chain, height)
+        self.hashes[hdr_hash] = (chain, height)
         tips[chain] = hdr_hash
-        return chain
+        return chain, hdr_hash
 
     def required_bits(self, chain, height, timestamp=None):
         # Testnet uses the timestamp; mainnet does not.

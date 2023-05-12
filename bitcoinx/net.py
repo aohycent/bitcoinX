@@ -7,7 +7,8 @@ import attr
 import logging
 import re
 import time
-from asyncio import Event, Queue
+import asyncio
+from asyncio import Event, Queue, IncompleteReadError
 from enum import IntEnum, IntFlag
 from functools import partial
 from io import BytesIO
@@ -15,13 +16,14 @@ from ipaddress import ip_address, IPv4Address, IPv6Address
 from os import urandom
 from struct import Struct, error as struct_error
 
-from .errors import ConnectionClosedError, ProtocolError, ForceDisconnectError
+from .errors import ProtocolError, ForceDisconnectError
 from .hashes import double_sha256
-from .headers import Headers
+from .headers import Headers, header_prev_hash, hash_to_hex_str
 from .packing import (
     pack_byte, pack_le_int32, pack_le_uint32, pack_le_int64, pack_le_uint64, pack_varint,
     pack_varbytes, pack_port, unpack_port,
     read_varbytes, read_varint, read_le_int32, read_le_uint32, read_le_uint64, read_le_int64,
+    read_list
 )
 
 
@@ -305,13 +307,13 @@ class MessageHeader:
 
     @classmethod
     async def from_stream(cls, stream):
-        raw_std = await stream.recv_exact(cls.STD_HEADER_SIZE)
+        raw_std = await stream.readexactly(cls.STD_HEADER_SIZE)
         magic, command_bytes, payload_len, checksum = std_unpack(raw_std)
         is_extended = False
         if command_bytes == cls.EXTMSG:
             if checksum != empty_checksum or payload_len != 0xffffffff:
                 raise ProtocolError('ill-formed extended message header')
-            raw_ext = await stream.recv_exact(cls.EXT_HEADER_SIZE - cls.STD_HEADER_SIZE)
+            raw_ext = await stream.readexactly(cls.EXT_HEADER_SIZE - cls.STD_HEADER_SIZE)
             command_bytes, payload_len = ext_extra_unpack(raw_ext)
             is_extended = True
         return cls(magic, command_bytes, payload_len, checksum, is_extended)
@@ -432,6 +434,13 @@ class ServicePacking:
         count = read_varint(read)
         read_with_timestamp = cls.read_with_timestamp
         return [read_with_timestamp(read) for _ in range(count)]
+
+
+def pack_block_locator(protocol_version, locator, hash_stop=None):
+    parts = [pack_le_int32(protocol_version), pack_varint(len(locator))]
+    parts.extend(locator)
+    parts.append(hash_stop or bytes(32))
+    return b''.join(parts)
 
 
 class BitcoinService:
@@ -610,7 +619,8 @@ class Node:
         self.peers = []
 
     async def connect(self, net_address):
-        pass
+        peer = Peer(self, net_address)
+        await peer.connect()
 
 
 class PeerLogger(logging.LoggerAdapter):
@@ -629,11 +639,8 @@ class Peer:
     associated connections.
     '''
 
-    def __init__(self, node, address, *, verbosity=2):
+    def __init__(self, node, address):
         self.node = node
-        # Verbosity: 0 (warnings), 1 (info), 2 (debug)
-        self.verbosity = verbosity
-
         self.is_outgoing = False
         # An instance of BitcoinService
         self.their_service = BitcoinService(address=address)
@@ -652,6 +659,7 @@ class Peer:
         logger = logging.getLogger('Peer')
         context = {'conn_id': f'{address}'}
         self.logger = PeerLogger(logger, context)
+        self.debug = logger.isEnabledFor(logging.DEBUG)
 
     def log_service_details(self, serv, headline):
         self.logger.info(headline)
@@ -687,7 +695,6 @@ class Peer:
     def connection_for_command(self, _command):
         return self.connection
 
-
     async def send_message(self, command, payload):
         '''Send a command and its payload.'''
         connection = self.connection_for_command(command)
@@ -716,10 +723,11 @@ class Peer:
         # FIXME: handle large payloads in a streaming fashion
 
         # Consume the payload
-        payload = await connection.recv_exact(header.payload_len)
+        payload = await connection.readexactly(header.payload_len)
         handler = getattr(self, f'on_{command}', None)
         if not handler:
-            self.logger.debug(f'ignoring unhandled {command} command')
+            if self.debug:
+                self.logger.debug(f'ignoring unhandled {command} command')
             return
 
         if not header.is_extended and header.payload_checksum(payload) != header.checksum:
@@ -749,11 +757,11 @@ class Peer:
                     raise ForceDisconnectError(f'bad magic: got 0x{header.magic.hex()} '
                                                f'expected 0x{network_magic.hex()}')
 
-                if self.verbosity >= 2:
+                if self.debug:
                     logger.debug(f'<- {header} payload {header.payload_len:,d} bytes')
 
                 await self.handle_message(connection, header)
-            except ConnectionClosedError:
+            except IncompleteReadError:
                 logger.info('connection closed remotely')
                 raise
             except ForceDisconnectError as e:
@@ -784,18 +792,28 @@ class Peer:
                 await send(header)
                 await send(payload)
 
-    # async def connect(self):
-    #     '''Make an outgoing connection to the main address.  Further connections as part of an
-    #     association are spawned as necessary.
-    #     '''
-    #     self.is_outgoing = True
-    #     async with connect(self.their_service.address):
-    #         pass
-
-    # async def sync_headers(self):
-    #     '''Call to synchronize remote chain with our headers.'''
-    #     #self.logger.debug(f'requesting headers; locator has {len(locator)} entries')
-    #     #await self.send_message(NetMessage.GETHEADERS, pack_block_locator(locator))
+    async def connect(self):
+        '''Make an outgoing connection to the main address.  Further connections as part of an
+        association are spawned as necessary.
+        '''
+        self.is_outgoing = True
+        address = self.their_service.address
+        reader, writer = await asyncio.open_connection(str(address.host), address.port)
+        try:
+            connection = Connection(reader.readexactly, writer)
+            self.connection = connection
+            loops = [asyncio.create_task(loop) for loop in
+                     (self.recv_messages_loop(connection), self.send_messages_loop(connection))]
+            asyncio.create_task(self.get_headers())
+            await asyncio.wait(loops, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            writer.close()
+            await writer.wait_closed()
+            for loop in loops:
+                if loop.done():
+                    loop.result()
+                else:
+                    loop.cancel()
 
     # Call to request various things from the peer
 
@@ -808,6 +826,19 @@ class Peer:
     async def get_block(self, block_hash):
         '''Call to request the block with the given hash.'''
 
+    async def get_headers(self, chain=None):
+        '''Send a request to get headers with the chain's block locator.  If chain is None,
+        the logest chain is used.
+
+        Calling this with no argument forms a loop with on_headers() whose eventual effect
+        is to synchronize the peer's headers.
+        '''
+        locator = (chain or self.node.headers.longest_chain()).block_locator()
+        payload = pack_block_locator(self.node.our_service.protocol_version, locator)
+        if self.debug:
+            self.logger.debug(f'requesting headers; locator has {len(locator)} entries')
+        await self.send_message(MessageHeader.GETHEADERS, payload)
+
     # Callbacks when certain messages are received.
 
     async def on_addr(self, services):
@@ -815,6 +846,42 @@ class Peer:
 
     async def on_block(self, raw):
         '''Called when a block is received.'''
+
+    async def on_headers(self, payload):
+        '''Handle getting a bunch of headers.'''
+        def read_one(read):
+            raw_header = read(80)
+            # A stupid tx count which seems to always be zero...
+            read_varint(read)
+            return raw_header
+
+        headers = self.node.headers
+        read = BytesIO(payload).read
+        raw_headers = read_list(read, read_one)
+        if len(raw_headers) > 2000:
+            self.logger.warning(f'{len(raw_headers):,d} headers in headers message')
+
+        # Synchronized?
+        if not raw_headers:
+            if self.debug:
+                self.logger.debug(f'headers synchronized to height {headers.height}')
+            return
+
+        prev_hash = header_prev_hash(raw_headers[0])
+        chain, height = headers.lookup(prev_hash)
+        if chain is None:
+            self.logger.error(f'on_headers: {hash_to_hex_str(prev_hash)} not present')
+            return
+        if self.debug:
+            self.logger.debug(f'connecting {len(raw_headers):,d} block headers '
+                              f'starting at height {height + 1:,d}')
+
+        for raw_header in raw_headers:
+            if prev_hash != header_prev_hash(raw_header):
+                raise ProtocolError('headers do not form a chain')
+            chain, prev_hash = headers.connect(raw_header)
+
+        await self.get_headers(chain)
 
     async def on_inv(self, items):
         '''Called when an inv message is received advertising availability of various objects.'''
@@ -853,22 +920,10 @@ class Connection:
     # Lower level: CMPCTBLOCK BLOCKTXN CREATESTRM GETBLOCKTXN GETHEADERS HEADERS
     #              NOTFOUND PING PONG REJECT PROTOCONF REPLY REVOKEMID SENDCMPCT SENDHEADERS
     #              STREAMACK HDRSEN SENDHDRSEN GETHDRSEN
-    def __init__(self, recv, send):
-        self.recv = recv
-        self.send = send
+    def __init__(self, readexactly, writer):
+        self.readexactly = readexactly
+        self.writer = writer
         self.outgoing_messages = Queue()
-
-    async def recv_exact(self, size):
-        recv = self.recv
-        parts = []
-        while size > 0:
-            part = await recv(size)
-            print('Got:', part)
-            if not part:
-                raise ConnectionClosedError(f'connection closed with {size:,d} bytes left')
-            parts.append(part)
-            size -= len(part)
-        return b''.join(parts)
 
     # async def chunks(self, chunk_size, total_size):
     #     '''Asynchronous generator of chunks.  Caller must send the number of bytes consumed.'''
@@ -885,3 +940,8 @@ class Connection:
     #         consumed = bio.tell()
     #         remaining -= consumed
     #         residual = memoryview(chunk[consumed:])
+
+    async def send(self, data):
+        stream = self.writer
+        stream.write(data)
+        await stream.drain()
