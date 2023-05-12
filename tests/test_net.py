@@ -459,8 +459,8 @@ class TestProtoconf:
         assert Protoconf(max_payload, policies).payload() == bytes.fromhex(result)
 
     @pytest.mark.parametrize('max_payload, policies, result', protoconf_tests)
-    def test_read(self, max_payload, policies, result):
-        pc = Protoconf.read(BytesIO(bytes.fromhex(result)).read)
+    def test_from_payload(self, max_payload, policies, result):
+        pc = Protoconf.from_payload(bytes.fromhex(result))
         assert pc.max_payload == max_payload
         assert pc.stream_policies == policies
 
@@ -469,18 +469,18 @@ class TestProtoconf:
         raw = bytearray(Protoconf(2_000_000, [b'Default']).payload())
         raw[0] = N
         with pytest.raises(ProtocolError):
-            Protoconf.read(BytesIO(raw).read)
+            Protoconf.from_payload(raw)
 
     def test_bad_max_payload(self):
         raw = Protoconf(Protoconf.LEGACY_MAX_PAYLOAD - 1, [b'Default']).payload()
         with pytest.raises(ProtocolError):
-            Protoconf.read(BytesIO(raw).read)
+            Protoconf.from_payload(raw)
 
     def test_logging(self, caplog):
         raw = bytearray(Protoconf(2_000_000, [b'Default']).payload())
         raw[0] = 3
         with caplog.at_level('WARNING'):
-            Protoconf.read(BytesIO(raw).read)
+            Protoconf.from_payload(raw)
         assert 'unexpected field count' in caplog.text
 
 
@@ -492,8 +492,7 @@ class Dribble:
         self.cursor = 0
 
     def stream(self):
-        peer = FakePeer(X_node, X_address)
-        return Connection(peer, self.recv, None)
+        return Connection(self.recv, None)
 
     async def recv(self, size):
         old_cursor = self.cursor
@@ -612,7 +611,7 @@ class FakePeer(Peer):
         # Incoming message queue
         self.queue = Queue()
         self.residual = b''
-        self.connection = Connection(self, self.recv, self.send)
+        self.connection = Connection(self.recv, self.send)
 
     def connect_to(self, peer):
         peer.is_outgoing = False
@@ -652,30 +651,23 @@ def setup_connection(out_peer=None, in_peer=None):
 
 async def run_connection(peers, post_handshake=None):
 
-    rm_loops = handshakes = []
+    rm_loops = sm_loops = []
     try:
-        rm_loops = [create_task(peer.connection.recv_messages_loop()) for peer in peers]
-        handshakes = [create_task(peer.connection._perform_handshake()) for peer in peers]
+        rm_loops = [create_task(peer.recv_messages_loop(peer.connection)) for peer in peers]
+        sm_loops = [create_task(peer.send_messages_loop(peer.connection)) for peer in peers]
 
-        for handshake in handshakes:
-            try:
-                await asyncio.wait_for(handshake, timeout=0.01)
-            except asyncio.TimeoutError:
-                pass
-
-        # Let protoconf be processed (not sure if needed)
-        await sleep(0.001)
+        await sleep(0.02)
 
         if post_handshake:
             await post_handshake()
             await sleep(0.01)
 
-        # Raise any exception from the message loops
+        # Raise any exception from receiving messages
         for rm_loop in rm_loops:
             if rm_loop.done():
                 rm_loop.result()
     finally:
-       for task in handshakes + rm_loops:
+       for task in rm_loops + sm_loops:
             if not task.done():
                 task.cancel()
 
@@ -706,7 +698,7 @@ class TestConnection:
 
         await run_connection(peers)
 
-        assert all(not peer.connection.disconnected for peer in peers)
+        assert all(not peer.disconnected for peer in peers)
 
         # Check all relevant details were correctly recorded in each node
         for check, other in ((in_peer, out_peer), (out_peer, in_peer)):
@@ -736,7 +728,7 @@ class TestConnection:
         with pytest.raises(ForceDisconnectError) as e:
             await run_connection([peer])
         assert 'connected to ourself' in str(e.value)
-        assert peer.connection.disconnected
+        assert peer.disconnected
 
     @pytest.mark.asyncio
     async def test_bad_magic(self):
@@ -745,34 +737,34 @@ class TestConnection:
         with pytest.raises(ForceDisconnectError) as e:
             await run_connection(peers)
         assert 'bad magic' in str(e.value)
-        assert any(peer.connection.disconnected for peer in peers)
+        assert any(peer.disconnected for peer in peers)
 
     @pytest.mark.asyncio
     async def test_bad_checksum(self):
-        async def hijack_message(header):
+        async def hijack_message(connection, header):
             header.checksum = bytes(4)
-            await old_handler(header)
+            await old_handler(connection, header)
 
         peers = setup_connection()
         out_peer, in_peer = peers
-        old_handler = out_peer.connection._handle_message
-        out_peer.connection._handle_message = hijack_message
+        old_handler = out_peer.handle_message
+        out_peer.handle_message = hijack_message
 
         with pytest.raises(ForceDisconnectError) as e:
             await run_connection(peers)
         assert 'bad checksum for version command' in str(e.value)
-        assert any(peer.connection.disconnected for peer in peers)
+        assert any(peer.disconnected for peer in peers)
 
     @pytest.mark.asyncio
     async def test_unknown_command(self, caplog):
         async def send_unknown_message():
-            await peers[0].connection._send_message(b'foobar', b'')
+            await peers[0].send_message(b'foobar', b'')
 
         peers = setup_connection()
         with caplog.at_level('DEBUG'):
             await run_connection(peers, post_handshake=send_unknown_message)
 
-        assert not any(peer.connection.disconnected for peer in peers)
+        assert not any(peer.disconnected for peer in peers)
         assert 'ignoring unhandled foobar command' in caplog.text
 
     @pytest.mark.asyncio
@@ -780,25 +772,25 @@ class TestConnection:
         async def send_version_message():
             payload = peers[0].node.our_service.to_version_payload(
                 peers[0].their_service.address, bytes(8))
-            await peers[0].connection._send_message(MessageHeader.VERSION, payload)
+            await peers[0].send_message(MessageHeader.VERSION, payload)
 
         peers = setup_connection()
         with caplog.at_level('ERROR'):
             await run_connection(peers, post_handshake=send_version_message)
 
-        assert not any(peer.connection.disconnected for peer in peers)
+        assert not any(peer.disconnected for peer in peers)
         assert 'duplicate version message' in caplog.text
 
     @pytest.mark.asyncio
     async def test_duplicate_verack(self, caplog):
         async def send_verack_message():
-            await peers[0].connection._send_message(MessageHeader.VERACK, b' ')
+            await peers[0].send_message(MessageHeader.VERACK, b' ')
 
         peers = setup_connection()
         with caplog.at_level('ERROR'):
             await run_connection(peers, post_handshake=send_verack_message)
 
-        assert not any(peer.connection.disconnected for peer in peers)
+        assert not any(peer.disconnected for peer in peers)
         assert 'duplicate verack message' in caplog.text
         assert 'verack message has payload' in caplog.text
 
@@ -807,12 +799,13 @@ class TestConnection:
     @pytest.mark.asyncio
     async def test_verack_before_version(self, peer_index, caplog):
         peers = setup_connection()
-        await peers[peer_index].connection._send_message(MessageHeader.VERACK, b'')
+        peer = peers[peer_index]
+        await peer._send_unqueued(peer.connection, MessageHeader.VERACK, b'')
 
         with caplog.at_level('ERROR'):
             await run_connection(peers)
 
-        assert not any(peer.connection.disconnected for peer in peers)
+        assert not any(peer.disconnected for peer in peers)
         assert 'verack message received before version message sent' in caplog.text
 
     @pytest.mark.parametrize("peer_index", (0, 1))
@@ -820,7 +813,7 @@ class TestConnection:
     async def test_protoconf_before_verack(self, peer_index, caplog):
         async def bad_on_version(*args):
             await on_version(*args)
-            await peer.connection._send_message(MessageHeader.PROTOCONF, b'')
+            await peer._send_unqueued(peer.connection, MessageHeader.PROTOCONF, b'')
 
         peers = setup_connection()
         peer = peers[peer_index]
@@ -830,7 +823,7 @@ class TestConnection:
         with caplog.at_level('ERROR'):
             await run_connection(peers)
 
-        assert not any(peer.connection.disconnected for peer in peers)
+        assert not any(peer.disconnected for peer in peers)
         assert 'protoconf command received before handshake finished' in caplog.text
 
     @pytest.mark.parametrize("peer_index", (0, 1))
@@ -849,5 +842,5 @@ class TestConnection:
             with pytest.raises(ConnectionClosedError) as e:
                 await run_connection(peers)
 
-        assert not any(peer.connection.disconnected for peer in peers)
+        assert not any(peer.disconnected for peer in peers)
         assert 'connection closed remotely' in caplog.text
