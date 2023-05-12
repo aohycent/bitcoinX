@@ -341,6 +341,10 @@ X_service = BitcoinService(
     protoconf=X_protoconf,
     start_height=5,
 )
+X_node = Node(Bitcoin, our_service=X_service)
+Y_node = Node(Bitcoin)
+Y_node.headers = mainnet_headers
+testnet_node = Node(BitcoinTestnet)
 
 
 class TestServicePacking:
@@ -476,7 +480,8 @@ class Dribble:
         self.cursor = 0
 
     def stream(self):
-        return Connection('', self.recv, None)
+        peer = FakePeer(X_node, X_address)
+        return Connection(peer, self.recv, None)
 
     async def recv(self, size):
         old_cursor = self.cursor
@@ -502,24 +507,6 @@ class Dribble:
             parts.append(raw[start: start+length])
             start += length
         return parts
-
-
-class TestConnection:
-
-    @pytest.mark.parametrize("N", (5, 32, 100))
-    @pytest.mark.asyncio
-    async def test_recv_exact(self, N):
-        dribble = Dribble(memoryview(os.urandom(N)))
-        stream = dribble.stream()
-        assert dribble.raw == await stream.recv_exact(N)
-
-        dribble.cursor = 0
-        with pytest.raises(ConnectionClosedError):
-            await stream.recv_exact(N + 1)
-
-        dribble.cursor = 0
-        parts = [await stream.recv_exact(length) for length in Dribble.lengths(N)]
-        assert b''.join(parts) == dribble.raw
 
 
 std_header_tests = [
@@ -605,20 +592,21 @@ def random_net_address():
     return NetAddress(address, port)
 
 
-class FakeNode(Peer):
+class FakePeer(Peer):
 
-    def __init__(self, is_outgoing, their_address, headers, **kwargs):
-        super().__init__(headers, is_outgoing, **kwargs)
+    def __init__(self, node, address, **kwargs):
+        super().__init__(node, address, **kwargs)
         self.remote_peer = None
         # Incoming message queue
         self.queue = Queue()
         self.residual = b''
-
-        self.connection = Connection(their_address, self.recv, self.send)
-        self.protocol = Protocol(self, self.connection)
+        self.connection = Connection(self, self.recv, self.send)
 
     def connect_to(self, peer):
+        peer.is_outgoing = False
+        self.is_outgoing = True
         self.remote_peer = peer
+        peer.remote_peer = self
 
     async def recv(self, size):
         result = self.residual
@@ -639,24 +627,23 @@ class FakeNode(Peer):
         await self.remote_peer.queue.put(b'')
 
     @classmethod
-    def random(cls, is_outgoing, headers=None, **kwargs):
-        headers = headers or Headers(Bitcoin)
-        return cls(is_outgoing, random_net_address(), headers, **kwargs)
+    def random(cls, node, **kwargs):
+        return cls(node, random_net_address(), **kwargs)
 
 
 def setup_connection(out_peer=None, in_peer=None):
-    out_peer = out_peer or FakeNode.random(True)
-    in_peer = in_peer or FakeNode.random(False)
+    out_peer = out_peer or FakePeer.random(X_node)
+    in_peer = in_peer or FakePeer.random(X_node)
     out_peer.connect_to(in_peer)
-    in_peer.connect_to(out_peer)
     return (out_peer, in_peer)
 
 
 async def run_connection(peers, post_handshake=None):
 
+    rm_loops = handshakes = []
     try:
-        rm_loops = [create_task(peer.protocol.recv_messages_loop()) for peer in peers]
-        handshakes = [create_task(peer.protocol._perform_handshake()) for peer in peers]
+        rm_loops = [create_task(peer.connection.recv_messages_loop()) for peer in peers]
+        handshakes = [create_task(peer.connection._perform_handshake()) for peer in peers]
 
         for handshake in handshakes:
             try:
@@ -681,12 +668,28 @@ async def run_connection(peers, post_handshake=None):
                 task.cancel()
 
 
-class TestProtocol:
+class TestConnection:
+
+    @pytest.mark.parametrize("N", (5, 32, 100))
+    @pytest.mark.asyncio
+    async def test_recv_exact(self, N):
+        dribble = Dribble(memoryview(os.urandom(N)))
+        stream = dribble.stream()
+        assert dribble.raw == await stream.recv_exact(N)
+
+        dribble.cursor = 0
+        with pytest.raises(ConnectionClosedError):
+            await stream.recv_exact(N + 1)
+
+        dribble.cursor = 0
+        parts = [await stream.recv_exact(length) for length in Dribble.lengths(N)]
+        assert b''.join(parts) == dribble.raw
+
 
     @pytest.mark.asyncio
     async def test_handshake(self):
-        in_peer = FakeNode.random(False)
-        out_peer = FakeNode.random(True, headers=mainnet_headers, our_service=X_service)
+        in_peer = FakePeer.random(X_node)
+        out_peer = FakePeer.random(Y_node)
         peers = setup_connection(out_peer, in_peer)
 
         await run_connection(peers)
@@ -699,23 +702,24 @@ class TestProtocol:
             assert check.verack_received.is_set()
             assert check.their_service is not None
 
-            assert check.their_service.address == check.connection.their_address
-            assert check.their_service.services == other.our_service.services
-            assert check.their_service.protocol_version == other.our_service.protocol_version
-            other_user_agent = other.our_service.user_agent or '/bitcoinx:0.01/'
+            other_service = other.node.our_service
+            assert check.their_service.address == check.their_service.address
+            assert check.their_service.services == other_service.services
+            assert check.their_service.protocol_version == other_service.protocol_version
+            other_user_agent = other_service.user_agent or '/bitcoinx:0.01/'
             assert check.their_service.user_agent == other_user_agent
-            assert check.their_service.start_height == other.our_service.start_height
-            if other.our_service.timestamp is None:
+            assert check.their_service.start_height == other_service.start_height
+            if other_service.timestamp is None:
                 assert abs(check.their_service.timestamp - time.time()) < 1
             else:
-                assert check.their_service.timestamp == other.our_service.timestamp
-            assert check.their_service.relay == other.our_service.relay
-            assert check.their_service.assoc_id == other.our_service.assoc_id
-            assert check.their_service.protoconf == other.our_service.protoconf
+                assert check.their_service.timestamp == other_service.timestamp
+            assert check.their_service.relay == other_service.relay
+            assert check.their_service.assoc_id == other_service.assoc_id
+            assert check.their_service.protoconf == other_service.protoconf
 
     @pytest.mark.asyncio
     async def test_self_connect(self):
-        peer = FakeNode.random(True)
+        peer = FakePeer.random(X_node)
         peer.connect_to(peer)
         with pytest.raises(ForceDisconnectError) as e:
             await run_connection([peer])
@@ -724,7 +728,7 @@ class TestProtocol:
 
     @pytest.mark.asyncio
     async def test_bad_magic(self):
-        out_peer=FakeNode.random(True, headers=Headers(BitcoinTestnet))
+        out_peer=FakePeer.random(testnet_node)
         peers = setup_connection(out_peer)
         with pytest.raises(ForceDisconnectError) as e:
             await run_connection(peers)
@@ -739,8 +743,8 @@ class TestProtocol:
 
         peers = setup_connection()
         out_peer, in_peer = peers
-        old_handler = out_peer.protocol._handle_message
-        out_peer.protocol._handle_message = hijack_message
+        old_handler = out_peer.connection._handle_message
+        out_peer.connection._handle_message = hijack_message
 
         with pytest.raises(ForceDisconnectError) as e:
             await run_connection(peers)
@@ -750,7 +754,7 @@ class TestProtocol:
     @pytest.mark.asyncio
     async def test_unknown_command(self, caplog):
         async def send_unknown_message():
-            await peers[0].protocol._send_message(b'foobar', b'')
+            await peers[0].connection._send_message(b'foobar', b'')
 
         peers = setup_connection()
         with caplog.at_level('DEBUG'):
@@ -762,9 +766,9 @@ class TestProtocol:
     @pytest.mark.asyncio
     async def test_duplicate_version(self, caplog):
         async def send_version_message():
-            payload = peers[0].our_service.to_version_payload(
-                peers[0].connection.their_address, bytes(8))
-            await peers[0].protocol._send_message(MessageHeader.VERSION, payload)
+            payload = peers[0].node.our_service.to_version_payload(
+                peers[0].their_service.address, bytes(8))
+            await peers[0].connection._send_message(MessageHeader.VERSION, payload)
 
         peers = setup_connection()
         with caplog.at_level('ERROR'):
@@ -776,7 +780,7 @@ class TestProtocol:
     @pytest.mark.asyncio
     async def test_duplicate_verack(self, caplog):
         async def send_verack_message():
-            await peers[0].protocol._send_message(MessageHeader.VERACK, b' ')
+            await peers[0].connection._send_message(MessageHeader.VERACK, b' ')
 
         peers = setup_connection()
         with caplog.at_level('ERROR'):
@@ -791,7 +795,7 @@ class TestProtocol:
     @pytest.mark.asyncio
     async def test_verack_before_version(self, peer_index, caplog):
         peers = setup_connection()
-        await peers[peer_index].protocol._send_message(MessageHeader.VERACK, b'')
+        await peers[peer_index].connection._send_message(MessageHeader.VERACK, b'')
 
         with caplog.at_level('ERROR'):
             await run_connection(peers)
@@ -804,7 +808,7 @@ class TestProtocol:
     async def test_protoconf_before_verack(self, peer_index, caplog):
         async def bad_on_version(*args):
             await on_version(*args)
-            await peer.protocol._send_message(MessageHeader.PROTOCONF, b'')
+            await peer.connection._send_message(MessageHeader.PROTOCONF, b'')
 
         peers = setup_connection()
         peer = peers[peer_index]

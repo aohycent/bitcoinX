@@ -17,6 +17,7 @@ from struct import Struct, error as struct_error
 
 from .errors import ConnectionClosedError, ProtocolError, ForceDisconnectError
 from .hashes import double_sha256
+from .headers import Headers
 from .packing import (
     pack_byte, pack_le_int32, pack_le_uint32, pack_le_int64, pack_le_uint64, pack_varint,
     pack_varbytes, pack_port, unpack_port,
@@ -27,7 +28,7 @@ from .packing import (
 __all__ = (
     'is_valid_hostname', 'classify_host', 'validate_port', 'validate_protocol',
     'NetAddress', 'Service', 'ServicePart', 'BitcoinService', 'ServiceFlags', 'Protoconf',
-    'MessageHeader', 'Connection', 'Peer', 'Protocol',
+    'MessageHeader', 'Node', 'Peer', 'Connection',
 )
 
 #
@@ -505,36 +506,34 @@ class BitcoinService:
             assoc_id,
         ))
 
-    @classmethod
-    def read(cls, read):
-        '''Read a version payload.  Return a tuple (their_service, our_address, our_services,
-        nonce) as described in the payload.
+    def read_version_payload(self, payload):
+        '''Read a version payload and update member variables (except address).  Return a tuple
+        (our_address, our_services, nonce) from the payload.
         '''
-        protocol_version = read_le_uint32(read)
-        services = read_le_uint64(read)
-        timestamp = read_le_int64(read)
+        read = BytesIO(payload).read
+        self.protocol_version = read_le_uint32(read)
+        self.services = read_le_uint64(read)
+        self.timestamp = read_le_int64(read)
         our_address, our_services = ServicePacking.read(read)
-        their_address, _ = ServicePacking.read(read)   # Ignore redundant services field here
+        ServicePacking.read(read)   # Ignore
         nonce = read(8)
+
         user_agent = read_varbytes(read)
-        start_height = read_le_int32(read)
+        try:
+            self.user_agent = user_agent.decode()
+        except UnicodeDecodeError:
+            self.user_agent = '0x' + user_agent.hex()
+
+        self.start_height = read_le_int32(read)
         # Relay is optional, defaulting to True
-        relay = read(1) != b'\0'
+        self.relay = read(1) != b'\0'
         # Association ID is optional.  We set it to None if not provided.
         try:
-            assoc_id = read_varbytes(read)
+            self.assoc_id = read_varbytes(read)
         except struct_error:
-            assoc_id = None
+            self.assoc_id = None
 
-        try:
-            user_agent = user_agent.decode()
-        except UnicodeDecodeError:
-            user_agent = '0x' + user_agent.hex()
-
-        their_service = cls(address=their_address, services=services, user_agent=user_agent,
-                            protocol_version=protocol_version, start_height=start_height,
-                            relay=relay, timestamp=timestamp, assoc_id=assoc_id)
-        return (their_service, our_address, our_services, nonce)
+        return (our_address, our_services, nonce)
 
     def pack(self):
         '''Return the address and service flags as an encoded service.'''
@@ -600,7 +599,10 @@ class Protoconf:
 class Node:
     '''Represents the state of a network, e.g., mainnet.'''
 
-    def __init__(self, network):
+    def __init__(self, network, *, our_service=None):
+        self.network = network
+        self.our_service = our_service or BitcoinService()
+        # Headers
         self.headers = Headers(network)
         # List of peers.  Each peer has a unique assoc_id, and can have several
         # connections open.
@@ -611,28 +613,45 @@ class Node:
 
 
 class Peer:
-    '''Represents a single logical peer association.  There can be multiple connections even
-    to different network addresses.
+    '''Represents a single logical connection (an association) to a peer.  There can be
+    multiple actual connections to the peer.
 
-    Logic here is high-level - details of the network protocol are handled at the Protocol
-    level.
+    The Peer determines on which connection a message is sent, and tracks state across the
+    associated connections.
     '''
 
-    def __init__(self, headers, is_outgoing, *, our_service=None, verbosity=2):
-        self.headers = headers
-        self.is_outgoing = is_outgoing
+    def __init__(self, node, address, *, verbosity=2):
+        self.node = node
         # Verbosity: 0 (warnings), 1 (info), 2 (debug)
         self.verbosity = verbosity
 
-        self.network = headers.network
-        # Instances of BitcoinService
-        self.our_service = our_service or BitcoinService(start_height=headers)
-        self.their_service = None
+        self.is_outgoing = False
+        # An instance of BitcoinService
+        self.their_service = BitcoinService(address=address)
 
         # State
         self.version_sent = False
         self.version_received = Event()
         self.verack_received = Event()
+
+        # Logging
+        logger = logging.getLogger('C')
+        context = {'conn_id': f'{address}'}
+        self.logger = ConnectionLogger(logger, context)
+
+    def log_service_details(self, serv, headline):
+        self.logger.info(headline)
+        self.logger.info(f'    user_agent={serv.user_agent} services={serv.services!r}')
+        self.logger.info(f'    protocol={serv.protocol_version} height={serv.start_height:,d}  '
+                         f'relay={serv.relay} timestamp={serv.timestamp} assoc_id={serv.assoc_id}')
+
+    # async def connect(self):
+    #     '''Make an outgoing connection to the main address.  Further connections as part of an
+    #     association are spawned as necessary.
+    #     '''
+    #     self.is_outgoing = True
+    #     async with connect(self.their_service.address):
+    #         pass
 
     # async def sync_headers(self):
     #     '''Call to synchronize remote chain with our headers.'''
@@ -666,14 +685,12 @@ class Peer:
 
     async def on_protoconf(self, protoconf):
         '''Called when a protoconf message is received.'''
-        assert self.their_service
         self.their_service.protoconf = protoconf
 
-    async def on_version(self, their_service):
-        '''Called when a version message is received.   Their service is as they report it,
-        except the address is the actual connection address.'''
-        assert not self.their_service
-        self.their_service = their_service
+    async def on_version(self):
+        '''Called when a version message is received.   their_service has been updated as
+        they report it (except the address is unchanged).'''
+        self.log_service_details(self.their_service, 'received version message:')
 
 
 class ConnectionLogger(logging.LoggerAdapter):
@@ -684,24 +701,26 @@ class ConnectionLogger(logging.LoggerAdapter):
         return f'[{conn_id}] {msg}', kwargs
 
 
+class Connection:
+
     # TODO: AUTHCH AUTHRESP GETBLOCKS DATAREFTX DSDETECTED FEEFILTER MEMPOOL
     # Lower level: CMPCTBLOCK BLOCKTXN CREATESTRM GETBLOCKTXN GETHEADERS HEADERS
     #              NOTFOUND PING PONG REJECT PROTOCONF REPLY REVOKEMID SENDCMPCT SENDHEADERS
     #              STREAMACK HDRSEN SENDHDRSEN GETHDRSEN
-
-
-class Connection:
-
-    def __init__(self, their_address, recv, send):
-        self.their_address = their_address
+    def __init__(self, peer, recv, send):
+        self.peer = peer
         self.recv = recv
         self.send = send
         self.disconnected = False
 
-        # Logging
-        logger = logging.getLogger('C')
-        context = {'conn_id': f'{their_address}'}
-        self.logger = ConnectionLogger(logger, context)
+        # Quick access
+        self.logger = peer.logger
+        self.network_magic = peer.node.network.magic
+        self.verbosity = self.peer.verbosity
+
+        # Outgoing messages
+        self.nonce = urandom(8)
+        self.outgoing_messages = Queue()
 
     async def recv_exact(self, size):
         recv = self.recv
@@ -734,36 +753,13 @@ class Connection:
     #         remaining -= consumed
     #         residual = memoryview(chunk[consumed:])
 
-
-class Protocol:
-
-    def __init__(self, peer, connection):
-        '''net_address is a resolved NetAddress object.'''
-        self.peer = peer
-        self.connection = connection
-
-        # Quick access
-        self.logger = connection.logger
-        self.network_magic = peer.network.magic
-        self.verbosity = self.peer.verbosity
-
-        # Outgoing messages
-        self.nonce = urandom(8)
-        self.outgoing_messages = Queue()
-
-    def _log_service_details(self, serv, headline):
-        self.logger.info(headline)
-        self.logger.info(f'    user_agent={serv.user_agent} services={serv.services!r}')
-        self.logger.info(f'    protocol={serv.protocol_version} height={serv.start_height:,d}  '
-                         f'relay={serv.relay} timestamp={serv.timestamp} assoc_id={serv.assoc_id}')
-
     async def _send_message(self, command, payload):
         header = MessageHeader.std_bytes(self.network_magic, command, payload)
         if len(payload) + len(header) <= 536:
-            await self.connection.send(header + payload)
+            await self.send(header + payload)
         else:
-            await self.connection.send(header)
-            await self.connection.send(payload)
+            await self.send(header)
+            await self.send(payload)
 
     async def _handle_message(self, header):
         if not self.peer.verack_received.is_set():
@@ -779,7 +775,7 @@ class Protocol:
         # FIXME: handle large payloads in a streaming fashion
 
         # Consume the payload
-        payload = await self.connection.recv_exact(header.payload_len)
+        payload = await self.recv_exact(header.payload_len)
         handler = getattr(self, f'on_{command}', None)
         if not handler:
             self.logger.debug(f'ignoring unhandled {command} command')
@@ -792,18 +788,25 @@ class Protocol:
 
         await handler(payload)
 
+    def our_service(self):
+        '''Fetch our service, and refresh its start height.'''
+        node = self.peer.node
+        our_service = node.our_service
+        our_service.start_height = node.headers.height
+        return our_service
+
+
     async def _perform_handshake(self):
         '''Perform the initial handshake.  Send version and verack messages, and wait until a
         verack is received back.'''
-        our_service = self.peer.our_service
         if not self.peer.is_outgoing:
             # Incoming connections wait for version message first
             await self.peer.version_received.wait()
 
         # Send version message
-        our_service.start_height = self.peer.headers.height
-        self._log_service_details(our_service, 'sending version message:')
-        payload = our_service.to_version_payload(self.connection.their_address, self.nonce)
+        our_service = self.our_service()
+        self.peer.log_service_details(our_service, 'sending version message:')
+        payload = our_service.to_version_payload(self.peer.their_service.address, self.nonce)
         await self._send_message(MessageHeader.VERSION, payload)
 
         self.peer.version_sent = True
@@ -834,7 +837,7 @@ class Protocol:
         while True:
             header = 'incoming'
             try:
-                header = await MessageHeader.from_stream(self.connection)
+                header = await MessageHeader.from_stream(self)
                 if header.magic != self.network_magic:
                     raise ForceDisconnectError(f'bad magic: got 0x{header.magic.hex()} '
                                                f'expected 0x{self.network_magic.hex()}')
@@ -848,7 +851,7 @@ class Protocol:
                 raise
             except ForceDisconnectError as e:
                 logging.error(f'fatal protocol error, disconnecting: {e}')
-                await self.connection.disconnect()
+                await self.disconnect()
                 raise
             except ProtocolError as e:
                 logging.error(f'protocol error: {e}')
@@ -870,22 +873,18 @@ class Protocol:
                     while payload_len > 0:
                         payload = await parts_func()
                         payload_len -= len(payload)
-                        await self.connection.send(payload)
+                        await self.send(payload)
                 else:
-                    await self.connection.send(item)
+                    await self.send(item)
 
     async def on_version(self, payload):
         if self.peer.version_received.is_set():
             raise ProtocolError('duplicate version message')
         self.peer.version_received.set()
-        read = BytesIO(payload).read
-        their_service, _our_address, _our_services, nonce = BitcoinService.read(read)
+        _, _, nonce = self.peer.their_service.read_version_payload(payload)
         if nonce == self.nonce:
             raise ForceDisconnectError('connected to ourself')
-        # Overwrite their service address; the one sent is uninteresting
-        their_service.address = self.connection.their_address
-        self._log_service_details(their_service, 'received version message:')
-        await self.peer.on_version(their_service)
+        await self.peer.on_version()
 
     async def on_verack(self, payload):
         if not self.peer.version_sent:
