@@ -445,7 +445,7 @@ class BitcoinService:
                  address=None,
                  services=ServiceFlags.NODE_NONE,
                  user_agent=None,
-                 protocol_version=0,
+                 protocol_version=None,
                  start_height=0,
                  relay=True,
                  timestamp=None,
@@ -458,10 +458,11 @@ class BitcoinService:
         if not isinstance(address.host, (IPv4Address, IPv6Address)):
             raise ValueError('BitcoinService requires an IP address')
 
+        from bitcoinx import _version_str
         self.address = address
         self.services = ServiceFlags(services)
-        self.user_agent = user_agent
-        self.protocol_version = protocol_version
+        self.user_agent = user_agent or f'/bitcoinx/{_version_str}'
+        self.protocol_version = protocol_version or 70015
         self.start_height = start_height
         self.relay = relay
         self.timestamp = timestamp
@@ -491,7 +492,6 @@ class BitcoinService:
 
         timestamp = int(time.time()) if self.timestamp is None else self.timestamp
         assoc_id = b'' if self.assoc_id is None else pack_varbytes(self.assoc_id)
-        user_agent = '/bitcoinx:0.01/' if self.user_agent is None else self.user_agent
 
         return b''.join((
             pack_le_int32(self.protocol_version),
@@ -500,7 +500,7 @@ class BitcoinService:
             their_service_packed,
             self.pack(),   # In practice this is ignored by receiver
             nonce,
-            pack_varbytes(user_agent.encode()),
+            pack_varbytes(self.user_agent.encode()),
             pack_le_int32(self.start_height),
             pack_byte(self.relay),
             assoc_id,

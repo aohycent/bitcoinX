@@ -8,7 +8,7 @@ from ipaddress import IPv4Address, IPv6Address
 
 import pytest
 
-from bitcoinx import Bitcoin, BitcoinTestnet, double_sha256, Headers, pack_varint
+from bitcoinx import Bitcoin, BitcoinTestnet, double_sha256, Headers, pack_varint, _version_str
 from bitcoinx.net import *
 from bitcoinx.net import ServicePacking
 from bitcoinx.errors import ConnectionClosedError, ProtocolError, ForceDisconnectError
@@ -423,8 +423,20 @@ class TestBitcoinService:
         service = BitcoinService()
         assert service.address == NetAddress('::', 0, check_port=False)
         assert service.services == ServiceFlags.NODE_NONE
-        assert service.protocol_version == 0
-        assert service.user_agent is None
+        assert service.protocol_version == 70_015
+        assert service.user_agent == f'/bitcoinx/{_version_str}'
+        assert service.relay is True
+        assert service.timestamp is None
+        assert service.assoc_id is None
+        assert service.protoconf == Protoconf.default()
+        assert service.start_height == 0
+
+    def test_service_node_service(self):
+        service = Node(Bitcoin).our_service
+        assert service.address == NetAddress('::', 0, check_port=False)
+        assert service.services == ServiceFlags.NODE_NONE
+        assert service.protocol_version == 70_015
+        assert service.user_agent == f'/bitcoinx/{_version_str}'
         assert service.relay is True
         assert service.timestamp is None
         assert service.assoc_id is None
@@ -706,7 +718,7 @@ class TestConnection:
             assert check.their_service.address == check.their_service.address
             assert check.their_service.services == other_service.services
             assert check.their_service.protocol_version == other_service.protocol_version
-            other_user_agent = other_service.user_agent or '/bitcoinx:0.01/'
+            other_user_agent = other_service.user_agent or f'/bitcoinx:{_version_str}/'
             assert check.their_service.user_agent == other_user_agent
             assert check.their_service.start_height == other_service.start_height
             if other_service.timestamp is None:
