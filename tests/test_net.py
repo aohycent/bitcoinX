@@ -751,8 +751,8 @@ class TestConnection:
         async def send_unknown_message():
             await peers[0].send_message(b'foobar', b'')
 
-        peers = setup_connection()
         with caplog.at_level('DEBUG'):
+            peers = setup_connection()
             await run_connection(peers, post_handshake=send_unknown_message)
 
         assert not any(peer.disconnected for peer in peers)
