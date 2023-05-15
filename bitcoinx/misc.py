@@ -110,6 +110,16 @@ class NetAddress:
                 raise ValueError(f'invalid address string: {string}')
         return cls(host, port, check_port=check_port)
 
+    @classmethod
+    def ensure_resolved(cls, address):
+        '''If address is a string, convert it to a NetAddress.  Enforces the result be an IP
+        address.'''
+        if not isinstance(address, cls):
+            address = cls.from_string(address)
+        if not isinstance(address.host, (IPv4Address, IPv6Address)):
+            raise ValueError(f'a resolved IP address is required, not {address.host}')
+        return address
+
     @property
     def host(self):
         return self._host

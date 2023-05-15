@@ -224,6 +224,21 @@ class TestNetAddress:
         else:
             assert NetAddress.from_string(string,default_func=default_func) == answer
 
+    @pytest.mark.parametrize("item,answer",(
+        ('1.2.3.4:23', NetAddress('1.2.3.4', 23)),
+        ('[::1]:22', NetAddress('::1', 22)),
+        (NetAddress('1.2.3.4', 23), NetAddress('1.2.3.4', 23)),
+        (NetAddress.from_string('[::1]:22'), NetAddress('::1', 22)),
+        ('foo.bar:23', ValueError),
+        (NetAddress('foo.bar', 23), ValueError),
+        (2, TypeError),
+    ))
+    def test_ensure_resolved(self, item, answer):
+        if isinstance(answer, type) and issubclass(answer, Exception):
+            with pytest.raises(answer):
+                NetAddress.ensure_resolved(item)
+        else:
+            assert NetAddress.ensure_resolved(item) == answer
 
     @pytest.mark.parametrize("address,answer",(
         (NetAddress('foo.bar', 23), 'foo.bar:23'),

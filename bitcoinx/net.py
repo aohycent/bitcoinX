@@ -243,15 +243,10 @@ class BitcoinService:
                  timestamp=None,
                  protoconf=None,
                  assoc_id=None):
-        if address is None:
-            address = NetAddress('::', 0, check_port=False)
-        elif not isinstance(address, NetAddress):
-            address = NetAddress.from_string(address)
-        if not isinstance(address.host, (IPv4Address, IPv6Address)):
-            raise ValueError('BitcoinService requires an IP address')
-
         from bitcoinx import _version_str
-        self.address = address
+
+        self.address = (NetAddress('::', 0, check_port=False) if address is None else
+                        NetAddress.ensure_resolved(address))
         self.services = ServiceFlags(services)
         self.user_agent = user_agent or f'/bitcoinx/{_version_str}'
         self.protocol_version = protocol_version or 70015
