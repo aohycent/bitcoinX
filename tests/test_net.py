@@ -1,8 +1,7 @@
-import asyncio
 import os
 import random
 import time
-from asyncio import Queue, create_task, sleep
+from curio import Queue, sleep
 from io import BytesIO
 from ipaddress import IPv4Address, IPv6Address
 
@@ -254,36 +253,42 @@ class TestMessageHeader:
         assert MessageHeader.ext_bytes(magic, command, payload_len) == answer
 
     @pytest.mark.parametrize("magic, command, payload, answer", std_header_tests)
-    @pytest.mark.asyncio
-    async def test_from_stream_std(self, magic, command, payload, answer):
-        dribble = Dribble(answer)
-        header = await MessageHeader.from_stream(dribble.recv_exactly)
-        assert header.magic == magic
-        assert header.command_bytes == command
-        assert header.payload_len == len(payload)
-        assert header.checksum == double_sha256(payload)[:4]
-        assert header.is_extended is False
+    def test_from_stream_std(self, kernel, magic, command, payload, answer):
+        async def main():
+            dribble = Dribble(answer)
+            header = await MessageHeader.from_stream(dribble.recv_exactly)
+            assert header.magic == magic
+            assert header.command_bytes == command
+            assert header.payload_len == len(payload)
+            assert header.checksum == double_sha256(payload)[:4]
+            assert header.is_extended is False
+
+        kernel.run(main())
 
     @pytest.mark.parametrize("magic, command, payload_len, answer", ext_header_tests)
-    @pytest.mark.asyncio
-    async def test_from_stream_ext(self, magic, command, payload_len, answer):
-        dribble = Dribble(answer)
-        header = await MessageHeader.from_stream(dribble.recv_exactly)
-        assert header.magic == magic
-        assert header.command_bytes == command
-        assert header.payload_len == payload_len
-        assert header.checksum == bytes(4)
-        assert header.is_extended is True
+    def test_from_stream_ext(self, kernel, magic, command, payload_len, answer):
+        async def main():
+            dribble = Dribble(answer)
+            header = await MessageHeader.from_stream(dribble.recv_exactly)
+            assert header.magic == magic
+            assert header.command_bytes == command
+            assert header.payload_len == payload_len
+            assert header.checksum == bytes(4)
+            assert header.is_extended is True
+
+        kernel.run(main())
 
     @pytest.mark.parametrize("raw", (
         b'1234extmsg\0\0\0\0\0\0\xfe\xff\xff\xff\0\0\0\0command\0\0\0\0\0\5\0\0\0\0\0\0\0',
         b'4567extmsg\0\0\0\0\0\0\xff\xff\xff\xff\0\0\1\0command\0\0\0\0\0\5\0\0\0\0\0\0\0',
     ))
-    @pytest.mark.asyncio
-    async def test_from_stream_ext_bad(self, raw):
-        dribble = Dribble(raw)
-        with pytest.raises(ProtocolError):
-            await MessageHeader.from_stream(dribble.recv_exactly)
+    def test_from_stream_ext_bad(self, kernel, raw):
+        async def main():
+            dribble = Dribble(raw)
+            with pytest.raises(ProtocolError):
+                await MessageHeader.from_stream(dribble.recv_exactly)
+
+        kernel.run(main())
 
     @pytest.mark.parametrize("command", ('addr', 'ping', 'sendheaders'))
     def test_str(self, command):
