@@ -7,17 +7,16 @@
 Networking utilities that do not depend on (async) I/O.
 '''
 
-import asyncio
-from asyncio import Queue, Event, IncompleteReadError
-
 import attr
 import logging
 import time
 from enum import IntEnum, IntFlag
 from io import BytesIO
-from ipaddress import ip_address, IPv4Address, IPv6Address
+from ipaddress import ip_address
 from os import urandom
 from struct import Struct, error as struct_error
+
+from curio import Event, Queue, TaskGroup, open_connection, CancelledError
 
 from .errors import ProtocolError, ForceDisconnectError
 from .hashes import double_sha256, hash_to_hex_str
@@ -77,14 +76,14 @@ class MessageHeader:
     is_extended = attr.ib()
 
     @classmethod
-    async def from_stream(cls, stream):
-        raw_std = await stream.readexactly(cls.STD_HEADER_SIZE)
+    async def from_stream(cls, recv_exactly):
+        raw_std = await recv_exactly(cls.STD_HEADER_SIZE)
         magic, command_bytes, payload_len, checksum = std_unpack(raw_std)
         is_extended = False
         if command_bytes == cls.EXTMSG:
             if checksum != empty_checksum or payload_len != 0xffffffff:
                 raise ProtocolError('ill-formed extended message header')
-            raw_ext = await stream.readexactly(cls.EXT_HEADER_SIZE - cls.STD_HEADER_SIZE)
+            raw_ext = await recv_exactly(cls.EXT_HEADER_SIZE - cls.STD_HEADER_SIZE)
             command_bytes, payload_len = ext_extra_unpack(raw_ext)
             is_extended = True
         return cls(magic, command_bytes, payload_len, checksum, is_extended)
@@ -392,13 +391,21 @@ class Node:
         self.our_service = our_service or BitcoinService()
         # Headers
         self.headers = Headers(network)
-        # List of peers.  Each peer has a unique assoc_id, and can have several
-        # connections open.
-        self.peers = []
+        # Map of address -> Peer object.  Each peer has a unique assoc_id, and can have
+        # several connections open.
+        self.peers = {}
 
-    async def connect(self, net_address):
-        peer = Peer(self, net_address)
-        await peer.connect()
+    async def connect(self, peer):
+        '''Make an outgoing connection to the main address.  Further connections as part of an
+        association are spawned as necessary.'''
+        if not isinstance(peer, Peer):
+            peer = Peer(self, peer)
+        address = peer.their_service.address
+        if address in self.peers:
+            raise RuntimeError('already connecting or connected to {peer.address}')
+        self.peers[address] = peer
+        peer.is_outgoing = True
+        return Connection(peer)
 
 
 class PeerLogger(logging.LoggerAdapter):
@@ -427,6 +434,8 @@ class Peer:
         self.version_sent = False
         self.version_received = Event()
         self.verack_received = Event()
+        self.protoconf_sent = False
+        self.protoconf_received = False
         self.disconnected = False
         self.nonce = urandom(8)
 
@@ -438,6 +447,11 @@ class Peer:
         context = {'conn_id': f'{address}'}
         self.logger = PeerLogger(logger, context)
         self.debug = logger.isEnabledFor(logging.DEBUG)
+
+    async def _send_unqueued(self, connection, command, payload):
+        '''Send a command without queueing.  For use with handshake negotiation.'''
+        header = MessageHeader.std_bytes(self.node.network.magic, command, payload)
+        await connection.send(header + payload)
 
     def log_service_details(self, serv, headline):
         self.logger.info(headline)
@@ -479,13 +493,9 @@ class Peer:
         header = MessageHeader.std_bytes(self.node.network.magic, command, payload)
         await connection.outgoing_messages.put((header, payload))
 
-    async def _send_unqueued(self, connection, command, payload):
-        '''Send a command without queueing.'''
-        header = MessageHeader.std_bytes(self.node.network.magic, command, payload)
-        await connection.send(header + payload)
-
     async def disconnect(self):
         self.disconnected = True
+        self.connection = None
 
     async def handle_message(self, connection, header):
         if not self.verack_received.is_set():
@@ -514,84 +524,6 @@ class Peer:
             raise error(f'bad checksum for {header} command')
 
         await handler(payload)
-
-    #
-    # Message streaming.  These two loops must run concurrently.
-    #
-
-    async def recv_messages_loop(self, connection):
-        '''An asynchronous generator of incoming message headers.
-
-        Bytes are asynchonously read from a stream.  The caller is responsible for reading
-        the payload from the stream, and validating the checksum if necessary.
-        '''
-        network_magic = self.node.network.magic
-        logger = self.logger
-        while True:
-            header = 'incoming'
-            try:
-                header = await MessageHeader.from_stream(connection)
-                if header.magic != network_magic:
-                    raise ForceDisconnectError(f'bad magic: got 0x{header.magic.hex()} '
-                                               f'expected 0x{network_magic.hex()}')
-
-                if self.debug:
-                    logger.debug(f'<- {header} payload {header.payload_len:,d} bytes')
-
-                await self.handle_message(connection, header)
-            except IncompleteReadError:
-                logger.info('connection closed remotely')
-                raise
-            except ForceDisconnectError as e:
-                logger.error(f'fatal protocol error, disconnecting: {e}')
-                await self.disconnect()
-                raise
-            except ProtocolError as e:
-                logger.error(f'protocol error: {e}')
-            except Exception:
-                logger.exception(f'error handling {header} message')
-
-    async def send_messages_loop(self, connection):
-        '''Handles sending the queue of messages.  This sends all messages except the initial
-        version / verack handshake.
-        '''
-        await self.perform_handshake(connection)
-
-        # Send protoconf
-        await self.send_message(MessageHeader.PROTOCONF, self.node.our_service.protoconf.payload())
-
-        send = connection.send
-        while True:
-            # FIXME: handle extended messages
-            header, payload = await connection.outgoing_messages.get()
-            if len(payload) + len(header) <= 536:
-                await send(header + payload)
-            else:
-                await send(header)
-                await send(payload)
-
-    async def connect(self):
-        '''Make an outgoing connection to the main address.  Further connections as part of an
-        association are spawned as necessary.
-        '''
-        self.is_outgoing = True
-        address = self.their_service.address
-        reader, writer = await asyncio.open_connection(str(address.host), address.port)
-        try:
-            connection = Connection(reader.readexactly, writer)
-            self.connection = connection
-            loops = [asyncio.create_task(loop) for loop in
-                     (self.recv_messages_loop(connection), self.send_messages_loop(connection))]
-            asyncio.create_task(self.get_headers())
-            await asyncio.wait(loops, return_when=asyncio.FIRST_COMPLETED)
-        finally:
-            writer.close()
-            await writer.wait_closed()
-            for loop in loops:
-                if loop.done():
-                    loop.result()
-                else:
-                    loop.cancel()
 
     # Call to request various things from the peer
 
@@ -682,37 +614,119 @@ class Peer:
 
     async def on_protoconf(self, payload):
         '''Called when a protoconf message is received.'''
+        if self.protoconf_received:
+            raise ProtocolError('duplicate protoconf message received')
+        self.protoconf_received = True
         self.their_service.protoconf = Protoconf.from_payload(payload, self.logger)
+
+    async def send_protoconf(self):
+        if self.protoconf_sent:
+            self.logger.warning('protoconf message already sent')
+            return
+        self.protoconf_sent = True
+        await self.send_message(MessageHeader.PROTOCONF,
+                                self.node.our_service.protoconf.payload())
+
+    #
+    # Low-level message streaming
+    #
+
+    async def manage_connection(self, connection, *, perform_handshake=True,
+                                send_protoconf=True, sync_headers=True):
+        if self.connection:
+            raise RuntimeError('a connection is already being managed')
+        self.connection = connection
+        try:
+            with TaskGroup() as group:
+                await group.spawn(self.recv_messages_loop, connection)
+                await group.spawn(self.send_messages_loop, connection)
+                if perform_handshake:
+                    await group.spawn(self.perform_handshake, connection)
+                if send_protoconf:
+                    await group.spawn(self.send_protoconf)
+                if sync_headers:
+                    await group.spawn(self.get_headers)
+
+                async for task in group:
+                    task.result    # pylint:disable=W0104
+        finally:
+            await self.disconnect()
+
+    async def recv_messages_loop(self, connection):
+        '''Reads messages from a stream and passes them to handlers for processing.'''
+        network_magic = self.node.network.magic
+        logger = self.logger
+        while True:
+            header = 'incoming'
+            try:
+                header = await MessageHeader.from_stream(connection.recv_exactly)
+                if header.magic != network_magic:
+                    raise ForceDisconnectError(f'bad magic: got 0x{header.magic.hex()} '
+                                               f'expected 0x{network_magic.hex()}')
+
+                if self.debug:
+                    logger.debug(f'<- {header} payload {header.payload_len:,d} bytes')
+
+                await self.handle_message(connection, header)
+            except EOFError:
+                logger.info('connection closed remotely')
+                raise
+            except ForceDisconnectError as e:
+                logger.error(f'fatal protocol error, disconnecting: {e}')
+                raise
+            except ProtocolError as e:
+                logger.error(f'protocol error: {e}')
+            except Exception:
+                logger.exception(f'error handling {header} message')
+
+    async def send_messages_loop(self, connection):
+        '''Handles sending the queue of messages.  This sends all messages except the initial
+        version / verack handshake.
+        '''
+        await self.verack_received.wait()
+
+        send = connection.send
+        while True:
+            # FIXME: handle extended messages
+            header, payload = await connection.get_message()
+            if len(payload) + len(header) <= 536:
+                await send(header + payload)
+            else:
+                await send(header)
+                await send(payload)
 
 
 class Connection:
 
-    # TODO: AUTHCH AUTHRESP GETBLOCKS DATAREFTX DSDETECTED FEEFILTER MEMPOOL
-    # Lower level: CMPCTBLOCK BLOCKTXN CREATESTRM GETBLOCKTXN GETHEADERS HEADERS
-    #              NOTFOUND PING PONG REJECT PROTOCONF REPLY REVOKEMID SENDCMPCT SENDHEADERS
-    #              STREAMACK HDRSEN SENDHDRSEN GETHDRSEN
-    def __init__(self, readexactly, writer):
-        self.readexactly = readexactly
-        self.writer = writer
+    def __init__(self, peer):
+        self.peer = peer
+        self.sock = None
         self.outgoing_messages = Queue()
 
-    # async def chunks(self, chunk_size, total_size):
-    #     '''Asynchronous generator of chunks.  Caller must send the number of bytes consumed.'''
-    #     remaining = total_size
-    #     residual = b''
-    #     while remaining:
-    #         size = min(remaining - len(residual), chunk_size)
-    #         chunk = await self.recv_exact(size)
-    #         if residual:
-    #             chunk = b''.join((residual, chunk))
-    #         bio = BytesIO(chunk)
-    #         yield bio
-    #         remaining -=
-    #         consumed = bio.tell()
-    #         remaining -= consumed
-    #         residual = memoryview(chunk[consumed:])
+    async def __aenter__(self):
+        address = self.peer.their_service.address
+        self.sock = await open_connection(str(address.host), address.port)
+        return self.peer
+
+    async def __aexit__(self, exc_type, exc_val, tb):
+        await self.sock.close()
 
     async def send(self, data):
-        stream = self.writer
-        stream.write(data)
-        await stream.drain()
+        await self.sock.sendall(data)
+
+    async def recv_exactly(self, nbytes):
+        recv = self.sock.recv
+        parts = []
+        while nbytes > 0:
+            try:
+                part = await recv(nbytes)
+            except CancelledError as e:
+                e.bytes_read = b''.join(parts)
+                raise
+            if not part:
+                e = EOFError('unexpected end of data')
+                e.bytes_read = b''.join(parts)
+                raise e
+            parts.append(part)
+            nbytes -= len(part)
+        return b''.join(parts)
