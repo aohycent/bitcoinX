@@ -191,7 +191,8 @@ class TestChainAndHeaders:
 
     def test_connect_duplicate(self):
         for n in range(0, self.N):
-            assert self.headers.connect(self.base_headers[n]) == self.base_chain
+            chain, _ = self.headers.connect(self.base_headers[n])
+            assert chain == self.base_chain
 
     def test_incorrect_bits(self):
         prev_hash = header_hash(Bitcoin.genesis_header)
@@ -244,7 +245,7 @@ class TestChainAndHeaders:
         # Add a new fork at height 1 than the fork chain
         headers = copy.copy(self.headers)
         raw_header = random_raw_header(header_hash(headers.network.genesis_header))
-        chain = headers.connect(raw_header, check_work=False)
+        chain, _ = headers.connect(raw_header, check_work=False)
         assert headers.chain_count() == 3
         assert chain.first_height == 1
 
@@ -256,7 +257,7 @@ class TestChainAndHeaders:
 
         # Add a new fork after the base of the fork fork chain
         raw_header2 = random_raw_header(header_hash(self.fork_headers[0]))
-        chain = headers.connect(raw_header2, check_work=False)
+        chain, _ = headers.connect(raw_header2, check_work=False)
         assert headers.chain_count() == 4
         assert chain.first_height == self.fork_chain.first_height + 1
 

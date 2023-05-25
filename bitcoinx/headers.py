@@ -283,7 +283,7 @@ class Headers:
             # Silently ignore duplicate headers
             duplicate, _ = self.lookup(hdr_hash)
             if duplicate:
-                return duplicate
+                return duplicate, hdr_hash
             # Form a new chain
             chain = Chain(chain, height)
 

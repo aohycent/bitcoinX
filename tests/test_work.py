@@ -105,7 +105,7 @@ def setup_headers(network, headers_file):
     last_height, = unpack_le_uint32(raw_data[-84:-80])
     last_raw = raw_data[-80:]
     headers = Headers(network)
-    chain = headers.connect(network.genesis_header)
+    chain, _ = headers.connect(network.genesis_header)
 
     raw_headers = {}
     for offset in range(0, len(raw_data), 84):
@@ -131,7 +131,7 @@ def test_mainnet_2016_headers():
 
     chain = next(iter(headers.chains()))
     for height in range(0, max_height + 1, 2016):
-        header = headers.header_at_height(chain, height)
+        header = chain.header_at_height(height)
         assert headers.required_bits(chain, height, None) == header.bits
         assert headers.required_bits(chain, height + 1, None) == header.bits
 
@@ -139,7 +139,7 @@ def test_mainnet_2016_headers():
 
     bounded_bits = 403011440
     # Test // 4 is lower bound for the last one
-    raw_header = bytearray(headers.raw_header_at_height(chain, height - 2016))
+    raw_header = bytearray(chain.raw_header_at_height(height - 2016))
     timestamp = header_timestamp(raw_header)
     # Add 8 weeks and a 14 seconds; the minimum to trigger it
     raw_header[68:72] = pack_le_uint32(timestamp + 4 * 2016 * 600 + 14)
@@ -184,7 +184,7 @@ def setup_compressed_headers(headers_file, ts_offset, network):
     raw_header[0] = 1
 
     headers = Headers(network)
-    chain = headers.connect(network.genesis_header)
+    chain, _ = headers.connect(network.genesis_header)
 
     raw_headers = {}
 
@@ -209,7 +209,7 @@ def setup_compressed_headers(headers_file, ts_offset, network):
 
 def setup_gzipped_headers(headers_file, network):
     headers = Headers(network)
-    chain = headers.connect(network.genesis_header)
+    chain, _ = headers.connect(network.genesis_header)
 
     raw_headers = {}
 
