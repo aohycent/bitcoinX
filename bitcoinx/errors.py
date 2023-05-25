@@ -84,7 +84,6 @@ class ForceDisconnectError(Exception):
     '''Raise on an error that must force a disconnection.'''
 
 
-
 #
 # Script errors
 #

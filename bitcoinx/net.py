@@ -224,7 +224,6 @@ def unpack_headers(payload):
     return read_list(read, read_one)
 
 
-
 class BitcoinService:
     '''Represents a bitcoin network service.
 
@@ -395,7 +394,7 @@ class Node:
         # several connections open.
         self.peers = {}
 
-    async def connect(self, peer):
+    def connect(self, peer):
         '''Make an outgoing connection to the main address.  Further connections as part of an
         association are spawned as necessary.'''
         if not isinstance(peer, Peer):
@@ -417,11 +416,12 @@ class PeerLogger(logging.LoggerAdapter):
 
 
 class Peer:
-    '''Represents a single logical connection (an association) to a peer.  There can be
-    multiple actual connections to the peer.
+    '''Represents a single logical connection (an association) to a peer.  This can consist of
+    multiple actual connections to the peer.  The peer determines on which connection a
+    message is sent, and tracks state across the associated connections.
 
-    The Peer determines on which connection a message is sent, and tracks state across the
-    associated connections.
+    If a client wishes to maintain several associations with the same address, it must be
+    done with separate Peer objects.
     '''
 
     def __init__(self, node, address):
@@ -434,22 +434,23 @@ class Peer:
         self.version_sent = False
         self.version_received = Event()
         self.verack_received = Event()
+        self.headers_synced = Event()
         self.protoconf_sent = False
         self.protoconf_received = False
-        self.disconnected = False
         self.nonce = urandom(8)
 
         # Connections
         self.connection = None
 
         # Logging
-        logger = logging.getLogger('Peer')
-        context = {'conn_id': f'{address}'}
+        logger = logging.getLogger().getChild('Peer')
+        context = {'peer_id': f'{address}'}
         self.logger = PeerLogger(logger, context)
         self.debug = logger.isEnabledFor(logging.DEBUG)
 
     async def _send_unqueued(self, connection, command, payload):
         '''Send a command without queueing.  For use with handshake negotiation.'''
+        self.logger.debug(f'sending unqueued {command} message')
         header = MessageHeader.std_bytes(self.node.network.magic, command, payload)
         await connection.send(header + payload)
 
@@ -494,7 +495,6 @@ class Peer:
         await connection.outgoing_messages.put((header, payload))
 
     async def disconnect(self):
-        self.disconnected = True
         self.connection = None
 
     async def handle_message(self, connection, header):
@@ -511,7 +511,7 @@ class Peer:
         # FIXME: handle large payloads in a streaming fashion
 
         # Consume the payload
-        payload = await connection.readexactly(header.payload_len)
+        payload = await connection.recv_exactly(header.payload_len)
         handler = getattr(self, f'on_{command}', None)
         if not handler:
             if self.debug:
@@ -543,6 +543,7 @@ class Peer:
         Calling this with no argument forms a loop with on_headers() whose eventual effect
         is to synchronize the peer's headers.
         '''
+        self.headers_synced.clear()
         locator = (chain or self.node.headers.longest_chain()).block_locator()
         payload = pack_block_locator(self.node.our_service.protocol_version, locator)
         if self.debug:
@@ -568,6 +569,7 @@ class Peer:
         if not raw_headers:
             if self.debug:
                 self.logger.debug(f'headers synchronized to height {headers.height}')
+            await self.headers_synced.set()
             return
 
         prev_hash = header_prev_hash(raw_headers[0])
@@ -597,7 +599,7 @@ class Peer:
         they report it (except the address is unchanged).'''
         if self.version_received.is_set():
             raise ProtocolError('duplicate version message')
-        self.version_received.set()
+        await self.version_received.set()
         _, _, nonce = self.their_service.read_version_payload(payload)
         if nonce == self.nonce:
             raise ForceDisconnectError('connected to ourself')
@@ -610,7 +612,7 @@ class Peer:
             self.logger.error('duplicate verack message')
         if payload:
             self.logger.error('verack message has payload')
-        self.verack_received.set()
+        await self.verack_received.set()
 
     async def on_protoconf(self, payload):
         '''Called when a protoconf message is received.'''
@@ -637,7 +639,7 @@ class Peer:
             raise RuntimeError('a connection is already being managed')
         self.connection = connection
         try:
-            with TaskGroup() as group:
+            async with TaskGroup() as group:
                 await group.spawn(self.recv_messages_loop, connection)
                 await group.spawn(self.send_messages_loop, connection)
                 if perform_handshake:
@@ -653,13 +655,14 @@ class Peer:
             await self.disconnect()
 
     async def recv_messages_loop(self, connection):
-        '''Reads messages from a stream and passes them to handlers for processing.'''
+        '''Read messages from a stream and pass them to handlers for processing.'''
         network_magic = self.node.network.magic
         logger = self.logger
         while True:
             header = 'incoming'
             try:
                 header = await MessageHeader.from_stream(connection.recv_exactly)
+
                 if header.magic != network_magic:
                     raise ForceDisconnectError(f'bad magic: got 0x{header.magic.hex()} '
                                                f'expected 0x{network_magic.hex()}')
@@ -680,7 +683,7 @@ class Peer:
                 logger.exception(f'error handling {header} message')
 
     async def send_messages_loop(self, connection):
-        '''Handles sending the queue of messages.  This sends all messages except the initial
+        '''Handle sending the queue of messages.  This sends all messages except the initial
         version / verack handshake.
         '''
         await self.verack_received.wait()
@@ -688,7 +691,7 @@ class Peer:
         send = connection.send
         while True:
             # FIXME: handle extended messages
-            header, payload = await connection.get_message()
+            header, payload = await connection.outgoing_messages.get()
             if len(payload) + len(header) <= 536:
                 await send(header + payload)
             else:
@@ -706,7 +709,7 @@ class Connection:
     async def __aenter__(self):
         address = self.peer.their_service.address
         self.sock = await open_connection(str(address.host), address.port)
-        return self.peer
+        return self
 
     async def __aexit__(self, exc_type, exc_val, tb):
         await self.sock.close()
