@@ -16,7 +16,7 @@ from ipaddress import ip_address
 from os import urandom
 from struct import Struct, error as struct_error
 
-from curio import Event, Queue, TaskGroup, open_connection, CancelledError
+from curio import Event, Queue, TaskGroup, open_connection, CancelledError, spawn
 
 from .errors import ProtocolError, ForceDisconnectError
 from .hashes import double_sha256, hash_to_hex_str
@@ -264,7 +264,6 @@ class BitcoinService:
         If self.timestamp is None, then the current time is used.
         their_service is a NetAddress or BitcoinService.
         '''
-        nonce = bytes(nonce)
         if len(nonce) != 8:
             raise ValueError('nonce must be 8 bytes')
 
@@ -388,13 +387,12 @@ class Node:
         # Headers
         self.headers = Headers(network)
 
-    def connect(self, *args, **kwargs):
+    def connect(self, service, **kwargs):
         '''Establish an outgoing Session to a service (a BitcoinService instance).
         The session spawns further connections as part of its association as necessary.
         '''
-        kwargs['is_outgoing'] = True
-        session = Session(self, *args, **kwargs)
-        return Connection(session)
+        session = Session(self, service, **kwargs)
+        return session
 
 
 class SessionLogger(logging.LoggerAdapter):
@@ -403,6 +401,15 @@ class SessionLogger(logging.LoggerAdapter):
     def process(self, msg, kwargs):
         peer_id = self.extra.get('peer_id', 'unknown')
         return f'[{peer_id}] {msg}', kwargs
+
+
+def random_nonce():
+    '''A nonce suitable for a PING or VERSION messages.'''
+    # bitcoind doesn't like zero nonces
+    while True:
+        nonce = urandom(8)
+        if nonce != bytes(8):
+            return nonce
 
 
 class Session:
@@ -414,12 +421,18 @@ class Session:
     done with separate Session objects.
     '''
 
-    def __init__(self, node, service, *, is_outgoing=False, protoconf=None):
+    def __init__(self, node, service, is_outgoing, *,
+                 protoconf=None,
+                 perform_handshake=True,
+                 send_protoconf=True,
+                 sync_headers=True):
         self.node = node
         self.their_service = service
         self.is_outgoing = is_outgoing
         self.our_protoconf = protoconf or Protoconf.default()
-        self.their_protoconf = None
+        self._perform_handshake = perform_handshake
+        self._send_protoconf = send_protoconf
+        self.sync_headers = sync_headers
 
         # State
         self.version_sent = False
@@ -427,17 +440,90 @@ class Session:
         self.verack_received = Event()
         self.headers_synced = Event()
         self.protoconf_sent = False
-        self.protoconf_received = False
-        self.nonce = urandom(8)
+        self.their_protoconf = None
+        self.nonce = random_nonce()
 
         # Connections
-        self.connection = None
+        self.connections = []     # A list of (connection, task) pairs
 
         # Logging
-        logger = logging.getLogger().getChild('Session')
+        logger = logging.getLogger('Session')
         context = {'peer_id': f'{service.address}'}
         self.logger = SessionLogger(logger, context)
         self.debug = logger.isEnabledFor(logging.DEBUG)
+
+    async def __aenter__(self):
+        address = self.their_service.address
+        connection = Connection(await open_connection(str(address.host), address.port))
+        task = await spawn(self.manage_main_connection, connection)
+        self.connections.append((connection, task))
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, tb):
+        await self.close()
+
+    async def close(self):
+        # Close connections
+        connections = self.connections
+        self.connections = []
+        exc = None
+        for connection, task in connections:
+            await connection.close()
+            print(task, type(task))
+            if task.terminated:
+                exc = exc or task.exception
+            else:
+                await task.cancel()
+        if exc:
+            raise exc
+
+    async def manage_main_connection(self, connection):
+        async with TaskGroup() as group:
+            await group.spawn(self.recv_messages_loop, connection)
+            await group.spawn(self.send_messages_loop, connection)
+            if self._perform_handshake:
+                await group.spawn(self.perform_handshake, connection)
+            if self._send_protoconf:
+                await group.spawn(self.send_protoconf)
+            if self.sync_headers:
+                await group.spawn(self.get_headers)
+
+            async for task in group:
+                task.result    # pylint:disable=W0104
+
+    async def send_messages_loop(self, connection):
+        '''Handle sending the queue of messages.  This sends all messages except the initial
+        version / verack handshake.
+        '''
+        await self.verack_received.wait()
+
+        send = connection.send
+        while True:
+            # FIXME: handle extended messages
+            header, payload = await connection.outgoing_messages.get()
+            if len(payload) + len(header) <= 536:
+                await send(header + payload)
+            else:
+                await send(header)
+                await send(payload)
+
+    async def recv_messages_loop(self, connection):
+        '''Read messages from a stream and pass them to handlers for processing.'''
+        while True:
+            header = 'incoming'
+            try:
+                header = await MessageHeader.from_stream(connection.recv_exactly)
+                await self.handle_message(connection, header)
+            except EOFError:
+                self.logger.info('connection closed remotely')
+                raise
+            except ForceDisconnectError as e:
+                self.logger.error(f'fatal protocol error, disconnecting: {e}')
+                raise
+            except ProtocolError as e:
+                self.logger.error(f'protocol error: {e}')
+            except Exception:
+                self.logger.exception(f'error handling {header} message')
 
     async def _send_unqueued(self, connection, command, payload):
         '''Send a command without queueing.  For use with handshake negotiation.'''
@@ -477,7 +563,8 @@ class Session:
         await self.verack_received.wait()
 
     def connection_for_command(self, _command):
-        return self.connection
+        main_connection, _ = self.connections[0]
+        return main_connection
 
     async def send_message(self, command, payload):
         '''Send a command and its payload.'''
@@ -485,10 +572,15 @@ class Session:
         header = MessageHeader.std_bytes(self.node.network.magic, command, payload)
         await connection.outgoing_messages.put((header, payload))
 
-    async def disconnect(self):
-        self.connection = None
-
     async def handle_message(self, connection, header):
+        if self.debug:
+            self.logger.debug(f'<- {header} payload {header.payload_len:,d} bytes')
+
+        magic = self.node.network.magic
+        if header.magic != magic:
+            raise ForceDisconnectError(f'bad magic: got 0x{header.magic.hex()} '
+                                       f'expected 0x{magic.hex()}')
+
         if not self.verack_received.is_set():
             if header.command_bytes not in (MessageHeader.VERSION, MessageHeader.VERACK):
                 raise ProtocolError(f'{header} command received before handshake finished')
@@ -619,89 +711,14 @@ class Session:
         await self.send_message(MessageHeader.PROTOCONF,
                                 self.our_protoconf.payload())
 
-    #
-    # Low-level message streaming
-    #
-
-    async def manage_connection(self, connection, *, perform_handshake=True,
-                                send_protoconf=True, sync_headers=True):
-        if self.connection:
-            raise RuntimeError('a connection is already being managed')
-        self.connection = connection
-        try:
-            async with TaskGroup() as group:
-                await group.spawn(self.recv_messages_loop, connection)
-                await group.spawn(self.send_messages_loop, connection)
-                if perform_handshake:
-                    await group.spawn(self.perform_handshake, connection)
-                if send_protoconf:
-                    await group.spawn(self.send_protoconf)
-                if sync_headers:
-                    await group.spawn(self.get_headers)
-
-                async for task in group:
-                    task.result    # pylint:disable=W0104
-        finally:
-            await self.disconnect()
-
-    async def recv_messages_loop(self, connection):
-        '''Read messages from a stream and pass them to handlers for processing.'''
-        network_magic = self.node.network.magic
-        logger = self.logger
-        while True:
-            header = 'incoming'
-            try:
-                header = await MessageHeader.from_stream(connection.recv_exactly)
-
-                if header.magic != network_magic:
-                    raise ForceDisconnectError(f'bad magic: got 0x{header.magic.hex()} '
-                                               f'expected 0x{network_magic.hex()}')
-
-                if self.debug:
-                    logger.debug(f'<- {header} payload {header.payload_len:,d} bytes')
-
-                await self.handle_message(connection, header)
-            except EOFError:
-                logger.info('connection closed remotely')
-                raise
-            except ForceDisconnectError as e:
-                logger.error(f'fatal protocol error, disconnecting: {e}')
-                raise
-            except ProtocolError as e:
-                logger.error(f'protocol error: {e}')
-            except Exception:
-                logger.exception(f'error handling {header} message')
-
-    async def send_messages_loop(self, connection):
-        '''Handle sending the queue of messages.  This sends all messages except the initial
-        version / verack handshake.
-        '''
-        await self.verack_received.wait()
-
-        send = connection.send
-        while True:
-            # FIXME: handle extended messages
-            header, payload = await connection.outgoing_messages.get()
-            if len(payload) + len(header) <= 536:
-                await send(header + payload)
-            else:
-                await send(header)
-                await send(payload)
-
 
 class Connection:
 
-    def __init__(self, peer):
-        self.peer = peer
-        self.sock = None
+    def __init__(self, sock):
+        self.sock = sock
         self.outgoing_messages = Queue()
 
-    async def __aenter__(self):
-        address = self.peer.their_service.address
-        self.sock = await open_connection(str(address.host), address.port)
-        return self
-
-    async def __aexit__(self, exc_type, exc_val, tb):
+    async def close(self):
         await self.sock.close()
 
     async def send(self, data):

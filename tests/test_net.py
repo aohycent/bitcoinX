@@ -366,23 +366,20 @@ def setup_connection(out_peer=None, in_peer=None):
     return (out_peer, in_peer)
 
 
-async def run_connection(peers, post_handshake=None):
+async def run_connection(sessions, post_handshake=None):
 
-    async with TaskGroup() as group:
-        for peer in peers:
-            await group.spawn(peer.manage_connection(peer))
+    for session in sessions:
+        task = await spawn(session.manage_main_connection, session)
+        session.connections.append((session, task))
+
+    await sleep(0.02)
+
+    if post_handshake:
+        await post_handshake()
         await sleep(0.02)
 
-        if post_handshake:
-            await post_handshake()
-            await sleep(0.02)
-
-        await group.cancel_remaining()
-
-        # Raise any exception
-        async for task in group:
-            if not task.cancelled:
-                task.result
+    for session in sessions:
+        await session.close()
 
 
 class TestConnection:
@@ -517,7 +514,7 @@ class TestConnection:
         async def main():
             async def bad_on_version(*args):
                 await on_version(*args)
-                await peer._send_unqueued(peer.connection, MessageHeader.PROTOCONF, b'')
+                await peer._send_unqueued(peer, MessageHeader.PROTOCONF, b'')
 
             peers = setup_connection()
             peer = peers[peer_index]
