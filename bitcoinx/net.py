@@ -396,14 +396,14 @@ class Node:
         service = BitcoinService(address=NetAddress(*address))
         session = Session(self, service, False, **kwargs)
         session.logger.info(f'connection from {service.address}')
-        await session.handle_main_connection(Connection(client))
+        await session.maintain_connection(Connection(client))
 
-    def connect(self, service, **kwargs):
-        '''Establish an outgoing Session to a service (a BitcoinService instance).
+    async def connect(self, service, **kwargs):
+        '''Establish an outgoing connection to a service (a BitcoinService instance).
         The session spawns further connections as part of its association as necessary.
         '''
-        session = Session(self, service, True, **kwargs)
-        return session
+        connection = Connection(await open_connection(str(address.host), address.port))
+        session = Session(self, service, connection, True, **kwargs)
 
 
 class SessionLogger(logging.LoggerAdapter):
@@ -432,13 +432,14 @@ class Session:
     done with separate Session objects.
     '''
 
-    def __init__(self, node, service, is_outgoing, *,
+    def __init__(self, node, service, connection, is_outgoing, *,
                  protoconf=None,
                  perform_handshake=True,
                  send_protoconf=True,
                  sync_headers=True):
         self.node = node
         self.their_service = service
+        self.connection = connection
         self.is_outgoing = is_outgoing
         self.our_protoconf = protoconf or Protoconf.default()
         self._perform_handshake = perform_handshake
@@ -454,41 +455,19 @@ class Session:
         self.their_protoconf = None
         self.nonce = random_nonce()
 
-        # Connections
-        self.connections = []     # A list of (connection, task) pairs
-
         # Logging
         logger = logging.getLogger('Session')
         context = {'peer_id': f'{service.address}'}
         self.logger = SessionLogger(logger, context)
         self.debug = logger.isEnabledFor(logging.DEBUG)
 
-    async def __aenter__(self):
-        address = self.their_service.address
-        connection = Connection(await open_connection(str(address.host), address.port))
-        task = await spawn(self.maintain_connection, connection)
-        self.connections.append((connection, task))
-        return self
-
-    async def __aexit__(self, exc_type, exc_val, tb):
-        await self.close()
-
     async def close(self):
-        # Close connections
-        connections = self.connections
-        self.connections = []
-        exc = None
-        for connection, task in connections:
-            await connection.close()
-            print(task, type(task))
-            if task.terminated:
-                exc = exc or task.exception
-            else:
-                await task.cancel()
-        if exc:
-            raise exc
+        await self.connection.close()
+        self.connection = None
 
-    async def maintain_connection(self, connection):
+    async def maintain_connection(self):
+        '''Maintains the main connection.'''
+        connection = self.connection
         async with TaskGroup() as group:
             await group.spawn(self.recv_messages_loop, connection)
             await group.spawn(self.send_messages_loop, connection)
@@ -574,8 +553,7 @@ class Session:
         await self.verack_received.wait()
 
     def connection_for_command(self, _command):
-        main_connection, _ = self.connections[0]
-        return main_connection
+        return self.connection
 
     async def send_message(self, command, payload):
         '''Send a command and its payload.'''

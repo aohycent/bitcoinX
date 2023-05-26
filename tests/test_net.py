@@ -312,22 +312,17 @@ def random_service():
     return BitcoinService(address=address)
 
 
-class FakePeer(Session):
-    '''A fake peer handy for simulating connections.  Also fakes the Connection class with the
-    send and recv_exactly methods.
-    '''
+class FakeConnection:
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.remote_peer = None
+   def __init__(self, remote_connection):
         # Incoming message queue
-        self.queue = Queue()
-        self.residual = b''
-        self.outgoing_messages = Queue()
+       self.remote_connection = remote_connection
+       self.queue = Queue()
+       self.residual = b''
+       self.outgoing_messages = Queue()
 
-    def connect_to(self, peer):
-        self.remote_peer = peer
-        peer.remote_peer = self
+    async def close(self):
+        pass
 
     async def recv_exactly(self, size):
         parts = []
@@ -347,19 +342,37 @@ class FakePeer(Session):
                 raise EOFError(b'', size)
 
     async def send(self, raw):
-        put = self.remote_peer.queue.put
+        put = self.remote_connection.queue.put
         for part in Dribble.parts(raw):
             await put(part)
+
+
+
+class FakePeer(Session):
+    '''A fake peer handy for simulating connections.  Also fakes the Connection class with the
+    send and recv_exactly methods.
+    '''
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.remote_peer = None
+
+    def connect_to(self, peer):
+        self.remote_peer = peer
+        peer.remote_peer = self
 
     async def close_connection(self):
         await self.remote_peer.queue.put(None)
 
     @classmethod
     def random(cls, node, **kwargs):
-        return cls(node, random_service(), **kwargs)
+        result = cls(node, random_service(), None, **kwargs)
+        result.connection = result
+        return result
 
 
-def setup_connection(out_peer=None, in_peer=None):
+def setup_connection(out_session=None, in_session=None):
+    out_session = our
     out_peer = out_peer or FakePeer.random(X_node, is_outgoing=True, protoconf=X_protoconf)
     in_peer = in_peer or FakePeer.random(X_node, is_outgoing=False)
     out_peer.connect_to(in_peer)
@@ -368,18 +381,18 @@ def setup_connection(out_peer=None, in_peer=None):
 
 async def run_connection(sessions, post_handshake=None):
 
-    for session in sessions:
-        task = await spawn(session.maintain_connection, session)
-        session.connections.append((session, task))
+    async with TaskGroup() as group:
+        for session in sessions:
+            await group.spawn(session.maintain_connection)
 
-    await sleep(0.02)
-
-    if post_handshake:
-        await post_handshake()
         await sleep(0.02)
 
-    for session in sessions:
-        await session.close()
+        if post_handshake:
+            await post_handshake()
+            await sleep(0.02)
+
+        for session in sessions:
+            await session.close()
 
 
 class TestConnection:
