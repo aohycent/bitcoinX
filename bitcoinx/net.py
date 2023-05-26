@@ -239,7 +239,6 @@ class BitcoinService:
                  start_height=0,
                  relay=True,
                  timestamp=None,
-                 protoconf=None,
                  assoc_id=None):
         from bitcoinx import _version_str
 
@@ -251,7 +250,6 @@ class BitcoinService:
         self.start_height = start_height
         self.relay = relay
         self.timestamp = timestamp
-        self.protoconf = protoconf or Protoconf.default()
         self.assoc_id = assoc_id
 
     def __eq__(self, other):
@@ -336,8 +334,7 @@ class BitcoinService:
             f'BitcoinService({self.address}, services={self.services!r}, '
             f'user_agent={self.user_agent!r}, protocol_version={self.protocol_version}, '
             f'start_height={self.start_height:,d} relay={self.relay} '
-            f'timestamp={self.timestamp}, protoconf={self.protoconf}, '
-            f'assoc_id={self.assoc_id!r})'
+            f'timestamp={self.timestamp}, assoc_id={self.assoc_id!r})'
         )
 
 
@@ -391,11 +388,12 @@ class Node:
         # Headers
         self.headers = Headers(network)
 
-    def connect(self, service):
+    def connect(self, *args, **kwargs):
         '''Establish an outgoing Session to a service (a BitcoinService instance).
         The session spawns further connections as part of its association as necessary.
         '''
-        session = Session(self, service, True)
+        kwargs['is_outgoing'] = True
+        session = Session(self, *args, **kwargs)
         return Connection(session)
 
 
@@ -416,10 +414,12 @@ class Session:
     done with separate Session objects.
     '''
 
-    def __init__(self, node, service, is_outgoing):
+    def __init__(self, node, service, *, is_outgoing=False, protoconf=None):
         self.node = node
         self.their_service = service
         self.is_outgoing = is_outgoing
+        self.our_protoconf = protoconf or Protoconf.default()
+        self.their_protoconf = None
 
         # State
         self.version_sent = False
@@ -607,10 +607,9 @@ class Session:
 
     async def on_protoconf(self, payload):
         '''Called when a protoconf message is received.'''
-        if self.protoconf_received:
+        if self.their_protoconf:
             raise ProtocolError('duplicate protoconf message received')
-        self.protoconf_received = True
-        self.their_service.protoconf = Protoconf.from_payload(payload, self.logger)
+        self.their_protoconf = Protoconf.from_payload(payload, self.logger)
 
     async def send_protoconf(self):
         if self.protoconf_sent:
@@ -618,7 +617,7 @@ class Session:
             return
         self.protoconf_sent = True
         await self.send_message(MessageHeader.PROTOCONF,
-                                self.node.our_service.protoconf.payload())
+                                self.our_protoconf.payload())
 
     #
     # Low-level message streaming

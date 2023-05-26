@@ -44,7 +44,6 @@ X_service = BitcoinService(
     relay=False,
     timestamp=500_000,
     assoc_id=b'Default',
-    protoconf=X_protoconf,
     start_height=5,
 )
 X_node = Node(Bitcoin, our_service=X_service)
@@ -122,7 +121,6 @@ class TestBitcoinService:
         assert service.relay is False
         assert service.timestamp == 500_000
         assert service.assoc_id == b'Default'
-        assert service.protoconf == X_protoconf
         assert service.start_height == 5
 
     def test_service_default(self):
@@ -134,7 +132,6 @@ class TestBitcoinService:
         assert service.relay is True
         assert service.timestamp is None
         assert service.assoc_id is None
-        assert service.protoconf == Protoconf.default()
         assert service.start_height == 0
 
     def test_service_node_service(self):
@@ -146,7 +143,6 @@ class TestBitcoinService:
         assert service.relay is True
         assert service.timestamp is None
         assert service.assoc_id is None
-        assert service.protoconf == Protoconf.default()
         assert service.start_height == 0
 
 
@@ -359,13 +355,13 @@ class FakePeer(Session):
         await self.remote_peer.queue.put(None)
 
     @classmethod
-    def random(cls, node, is_outgoing, **kwargs):
-        return cls(node, random_service(), is_outgoing, **kwargs)
+    def random(cls, node, **kwargs):
+        return cls(node, random_service(), **kwargs)
 
 
 def setup_connection(out_peer=None, in_peer=None):
-    out_peer = out_peer or FakePeer.random(X_node, True)
-    in_peer = in_peer or FakePeer.random(X_node, False)
+    out_peer = out_peer or FakePeer.random(X_node, is_outgoing=True, protoconf=X_protoconf)
+    in_peer = in_peer or FakePeer.random(X_node, is_outgoing=False)
     out_peer.connect_to(in_peer)
     return (out_peer, in_peer)
 
@@ -393,8 +389,8 @@ class TestConnection:
 
     def test_handshake(self, kernel):
         async def main():
-            in_peer = FakePeer.random(X_node, False)
-            out_peer = FakePeer.random(Y_node, True)
+            in_peer = FakePeer.random(X_node, is_outgoing=False)
+            out_peer = FakePeer.random(Y_node, is_outgoing=True)
             peers = setup_connection(out_peer, in_peer)
             await run_connection(peers)
 
@@ -417,13 +413,13 @@ class TestConnection:
                     assert check.their_service.timestamp == other_service.timestamp
                 assert check.their_service.relay == other_service.relay
                 assert check.their_service.assoc_id == other_service.assoc_id
-                assert check.their_service.protoconf == other_service.protoconf
+                assert check.their_protoconf == other.our_protoconf
 
         kernel.run(main())
 
     def test_self_connect(self, kernel):
         async def main():
-            peer = FakePeer.random(X_node, True)
+            peer = FakePeer.random(X_node, is_outgoing=True)
             peer.connect_to(peer)
             with pytest.raises(ForceDisconnectError) as e:
                 await run_connection([peer])
@@ -433,7 +429,7 @@ class TestConnection:
 
     def test_bad_magic(self, kernel):
         async def main():
-            out_peer=FakePeer.random(testnet_node, True)
+            out_peer=FakePeer.random(testnet_node, is_outgoing=True)
             peers = setup_connection(out_peer)
             with pytest.raises(ForceDisconnectError) as e:
                 await run_connection(peers)
