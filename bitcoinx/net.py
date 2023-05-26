@@ -32,7 +32,7 @@ from .misc import NetAddress
 
 __all__ = (
     'BitcoinService', 'ServiceFlags', 'Protoconf', 'MessageHeader',
-    'Node', 'Peer', 'Connection',
+    'Node', 'Session',
 )
 
 
@@ -390,24 +390,17 @@ class Node:
         self.our_service = our_service or BitcoinService()
         # Headers
         self.headers = Headers(network)
-        # Map of address -> Peer object.  Each peer has a unique assoc_id, and can have
-        # several connections open.
-        self.peers = {}
 
     def connect(self, peer):
         '''Make an outgoing connection to the main address.  Further connections as part of an
         association are spawned as necessary.'''
-        if not isinstance(peer, Peer):
-            peer = Peer(self, peer)
-        address = peer.their_service.address
-        if address in self.peers:
-            raise RuntimeError('already connecting or connected to {peer.address}')
-        self.peers[address] = peer
+        if not isinstance(peer, Session):
+            peer = Session(self, peer)
         peer.is_outgoing = True
         return Connection(peer)
 
 
-class PeerLogger(logging.LoggerAdapter):
+class SessionLogger(logging.LoggerAdapter):
 
     '''Prepends a connection identifier to a logging message.'''
     def process(self, msg, kwargs):
@@ -415,13 +408,13 @@ class PeerLogger(logging.LoggerAdapter):
         return f'[{peer_id}] {msg}', kwargs
 
 
-class Peer:
+class Session:
     '''Represents a single logical connection (an association) to a peer.  This can consist of
     multiple actual connections to the peer.  The peer determines on which connection a
     message is sent, and tracks state across the associated connections.
 
     If a client wishes to maintain several associations with the same address, it must be
-    done with separate Peer objects.
+    done with separate Session objects.
     '''
 
     def __init__(self, node, address):
@@ -443,9 +436,9 @@ class Peer:
         self.connection = None
 
         # Logging
-        logger = logging.getLogger().getChild('Peer')
+        logger = logging.getLogger().getChild('Session')
         context = {'peer_id': f'{address}'}
-        self.logger = PeerLogger(logger, context)
+        self.logger = SessionLogger(logger, context)
         self.debug = logger.isEnabledFor(logging.DEBUG)
 
     async def _send_unqueued(self, connection, command, payload):

@@ -311,7 +311,7 @@ def random_net_address():
     return NetAddress(address, port)
 
 
-class FakePeer(Peer):
+class FakePeer(Session):
     '''A fake peer handy for simulating connections.  Also fakes the Connection class with the
     send and recv_exactly methods.
     '''
