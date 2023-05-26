@@ -369,7 +369,7 @@ def setup_connection(out_peer=None, in_peer=None):
 async def run_connection(sessions, post_handshake=None):
 
     for session in sessions:
-        task = await spawn(session.manage_main_connection, session)
+        task = await spawn(session.maintain_connection, session)
         session.connections.append((session, task))
 
     await sleep(0.02)

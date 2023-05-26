@@ -11,6 +11,7 @@ import attr
 import logging
 import time
 from enum import IntEnum, IntFlag
+from functools import partial
 from io import BytesIO
 from ipaddress import ip_address
 from os import urandom
@@ -387,11 +388,21 @@ class Node:
         # Headers
         self.headers = Headers(network)
 
+    async def listen(self, host, port, **kwargs):
+        '''Listen for incoming connections.  kwargs are as for Session constructor.'''
+        await tcp_server(host, port, self.handle_client, partial(self.handle_client, kwargs))
+
+    async def handle_client(self, kwargs, client, address):
+        service = BitcoinService(address=NetAddress(*address))
+        session = Session(self, service, False, **kwargs)
+        session.logger.info(f'connection from {service.address}')
+        await session.handle_main_connection(Connection(client))
+
     def connect(self, service, **kwargs):
         '''Establish an outgoing Session to a service (a BitcoinService instance).
         The session spawns further connections as part of its association as necessary.
         '''
-        session = Session(self, service, **kwargs)
+        session = Session(self, service, True, **kwargs)
         return session
 
 
@@ -455,7 +466,7 @@ class Session:
     async def __aenter__(self):
         address = self.their_service.address
         connection = Connection(await open_connection(str(address.host), address.port))
-        task = await spawn(self.manage_main_connection, connection)
+        task = await spawn(self.maintain_connection, connection)
         self.connections.append((connection, task))
         return self
 
@@ -477,7 +488,7 @@ class Session:
         if exc:
             raise exc
 
-    async def manage_main_connection(self, connection):
+    async def maintain_connection(self, connection):
         async with TaskGroup() as group:
             await group.spawn(self.recv_messages_loop, connection)
             await group.spawn(self.send_messages_loop, connection)
