@@ -391,13 +391,12 @@ class Node:
         # Headers
         self.headers = Headers(network)
 
-    def connect(self, peer):
-        '''Make an outgoing connection to the main address.  Further connections as part of an
-        association are spawned as necessary.'''
-        if not isinstance(peer, Session):
-            peer = Session(self, peer)
-        peer.is_outgoing = True
-        return Connection(peer)
+    def connect(self, service):
+        '''Establish an outgoing Session to a service (a BitcoinService instance).
+        The session spawns further connections as part of its association as necessary.
+        '''
+        session = Session(self, service, True)
+        return Connection(session)
 
 
 class SessionLogger(logging.LoggerAdapter):
@@ -417,11 +416,10 @@ class Session:
     done with separate Session objects.
     '''
 
-    def __init__(self, node, address):
+    def __init__(self, node, service, is_outgoing):
         self.node = node
-        self.is_outgoing = False
-        # An instance of BitcoinService
-        self.their_service = BitcoinService(address=address)
+        self.their_service = service
+        self.is_outgoing = is_outgoing
 
         # State
         self.version_sent = False
@@ -437,7 +435,7 @@ class Session:
 
         # Logging
         logger = logging.getLogger().getChild('Session')
-        context = {'peer_id': f'{address}'}
+        context = {'peer_id': f'{service.address}'}
         self.logger = SessionLogger(logger, context)
         self.debug = logger.isEnabledFor(logging.DEBUG)
 

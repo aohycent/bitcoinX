@@ -311,13 +311,18 @@ def random_net_address():
     return NetAddress(address, port)
 
 
+def random_service():
+    address = random_net_address()
+    return BitcoinService(address=address)
+
+
 class FakePeer(Session):
     '''A fake peer handy for simulating connections.  Also fakes the Connection class with the
     send and recv_exactly methods.
     '''
 
-    def __init__(self, node, address, **kwargs):
-        super().__init__(node, address, **kwargs)
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
         self.remote_peer = None
         # Incoming message queue
         self.queue = Queue()
@@ -325,8 +330,6 @@ class FakePeer(Session):
         self.outgoing_messages = Queue()
 
     def connect_to(self, peer):
-        peer.is_outgoing = False
-        self.is_outgoing = True
         self.remote_peer = peer
         peer.remote_peer = self
 
@@ -356,13 +359,13 @@ class FakePeer(Session):
         await self.remote_peer.queue.put(None)
 
     @classmethod
-    def random(cls, node, **kwargs):
-        return cls(node, random_net_address(), **kwargs)
+    def random(cls, node, is_outgoing, **kwargs):
+        return cls(node, random_service(), is_outgoing, **kwargs)
 
 
 def setup_connection(out_peer=None, in_peer=None):
-    out_peer = out_peer or FakePeer.random(X_node)
-    in_peer = in_peer or FakePeer.random(X_node)
+    out_peer = out_peer or FakePeer.random(X_node, True)
+    in_peer = in_peer or FakePeer.random(X_node, False)
     out_peer.connect_to(in_peer)
     return (out_peer, in_peer)
 
@@ -390,8 +393,8 @@ class TestConnection:
 
     def test_handshake(self, kernel):
         async def main():
-            in_peer = FakePeer.random(X_node)
-            out_peer = FakePeer.random(Y_node)
+            in_peer = FakePeer.random(X_node, False)
+            out_peer = FakePeer.random(Y_node, True)
             peers = setup_connection(out_peer, in_peer)
             await run_connection(peers)
 
@@ -420,7 +423,7 @@ class TestConnection:
 
     def test_self_connect(self, kernel):
         async def main():
-            peer = FakePeer.random(X_node)
+            peer = FakePeer.random(X_node, True)
             peer.connect_to(peer)
             with pytest.raises(ForceDisconnectError) as e:
                 await run_connection([peer])
@@ -430,7 +433,7 @@ class TestConnection:
 
     def test_bad_magic(self, kernel):
         async def main():
-            out_peer=FakePeer.random(testnet_node)
+            out_peer=FakePeer.random(testnet_node, True)
             peers = setup_connection(out_peer)
             with pytest.raises(ForceDisconnectError) as e:
                 await run_connection(peers)
