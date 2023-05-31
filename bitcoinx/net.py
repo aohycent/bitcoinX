@@ -36,6 +36,8 @@ __all__ = (
     'Node', 'Session',
 )
 
+ZERO_NONCE = bytes(8)
+
 
 #
 # Constants and classes implementing the Bitcoin network protocol
@@ -419,7 +421,7 @@ def random_nonce():
     # bitcoind doesn't like zero nonces
     while True:
         nonce = urandom(8)
-        if nonce != bytes(8):
+        if nonce != ZERO_NONCE:
             return nonce
 
 
