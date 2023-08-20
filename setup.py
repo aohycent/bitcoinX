@@ -23,13 +23,13 @@ setuptools.setup(
     install_requires=['attrs', 'pycryptodomex', 'electrumsv-secp256k1'],
     packages=['bitcoinx'],
     description='Library of Bitcoin functions',
-    author='Neil Booth',
-    author_email='kyuupichan@gmail.com',
+    author='Afocha Hycent',
+    author_email='hycentonline@gmail.com',
     license='MIT Licence',
     # Tell setuptools to include data files specified by MANIFEST.in.
     include_package_data=True,
-    url='https://github.com/kyuupichan/bitcoinX',
-    download_url=('https://github.com/kyuupichan/bitcoinX/archive/'
+    url='https://github.com/aohycent/bitcoinX',
+    download_url=('https://github.com/aohycent/bitcoinX/archive/'
                   f'{version}.tar.gz'),
     long_description=(
         'Library of Bitcoin functions covering network protocol, consensus, '
