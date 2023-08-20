@@ -29,7 +29,7 @@ setuptools.setup(
     # Tell setuptools to include data files specified by MANIFEST.in.
     include_package_data=True,
     url='https://github.com/aohycent/bitcoinX',
-    download_url=('https://github.com/aohycent/bitcoinX/archive/'
+    download_url=('https://github.com/kyuupichan/bitcoinX/archive/'
                   f'{version}.tar.gz'),
     long_description=(
         'Library of Bitcoin functions covering network protocol, consensus, '
